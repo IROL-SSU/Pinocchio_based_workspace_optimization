@@ -47,6 +47,7 @@ input[type="checkbox"] { width: auto; justify-self: start; }
 .unit { color: #aeb7c3; min-width: 16px; font-size: 12px; }
 .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .muted { margin: 7px 0; color: #aeb7c3; font-size: 12px; line-height: 1.4; }
+a { color: #7fb6e8; }
 #evaluate { background: #2d5f8b; border-color: #3976aa; cursor: pointer; font-weight: 650; }
 #evaluate:hover { background: #356f9f; }
 #busy { margin: 8px 0 0; color: #f0c66c; font-size: 12px; }
@@ -67,6 +68,7 @@ input[type="checkbox"] { width: auto; justify-self: start; }
     <p class="live-badge">LIVE CONTROL UI · PARAMETERS + RESULTS</p>
     <h1>Decanting live evaluation</h1>
     <p class="muted">파라미터를 바꾸면 로컬 Python backend가 Pinocchio 계산을 수행하고 현재 결과를 MeshCat에 표시합니다.</p>
+    <p class="muted"><a id="studyLink" href="/study">UR20 check study &rarr;</a> — check pose와 collision target을 직접 지정해 계산합니다. 같은 scene과 로봇 모델을 공유하며, 이 화면의 공정 평가 결과 의미는 바뀌지 않습니다.</p>
     <fieldset>
       <legend>Evaluation</legend>
       <label>Profile <select id="profile" aria-label="Evaluation profile"></select></label>

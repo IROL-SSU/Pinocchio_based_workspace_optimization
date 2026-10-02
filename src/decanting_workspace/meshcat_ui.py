@@ -9,6 +9,7 @@ them in a redistributable HTML report.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import html
@@ -28,6 +29,28 @@ class PlaybackBackend(Protocol):
 
     def select(self, request: Mapping[str, object]) -> Mapping[str, object]:
         """Apply one cached selection and return its display/status details."""
+
+
+@dataclass(frozen=True)
+class JsonRoute:
+    """One extra JSON endpoint registered beside the legacy playback API.
+
+    ``serialized`` requests the shared compute lock for the duration of the
+    call.  Job control endpoints set it to ``False`` so progress polling and
+    cancellation stay responsive while a long worker run holds the lock
+    between checks.
+    """
+
+    handler: Callable[[Mapping[str, object]], Mapping[str, object]]
+    serialized: bool = True
+    invalid_error: str = "invalid_request"
+    failed_error: str = "request_failed"
+
+    def __post_init__(self) -> None:
+        if not callable(self.handler):
+            raise TypeError("JsonRoute handler must be callable")
+        if not isinstance(self.serialized, bool):
+            raise TypeError("JsonRoute serialized must be a boolean")
 
 
 class MeshcatControlServer(ThreadingHTTPServer):
@@ -56,12 +79,19 @@ class MeshcatControlServer(ThreadingHTTPServer):
         meshcat_url: str,
         *,
         page_builder: Callable[[str], str] | None = None,
+        extra_pages: Mapping[str, str] | None = None,
+        extra_json_get: Mapping[str, JsonRoute] | None = None,
+        extra_json_post: Mapping[str, JsonRoute] | None = None,
+        selection_lock: object | None = None,
     ) -> None:
         _validate_meshcat_url(meshcat_url)
         self.backend = backend
         self.meshcat_url = meshcat_url
         self.control_page = (page_builder or build_control_page)(meshcat_url)
-        self.selection_lock = Lock()
+        self.selection_lock = selection_lock or Lock()
+        self.extra_pages = _validated_pages(extra_pages)
+        self.extra_json_get = _validated_routes(extra_json_get, "extra_json_get")
+        self.extra_json_post = _validated_routes(extra_json_post, "extra_json_post")
         super().__init__(address, _PlaybackRequestHandler)
 
     @property
@@ -98,6 +128,18 @@ class _PlaybackRequestHandler(BaseHTTPRequestHandler):
         if path == "/healthz":
             self._send_json(HTTPStatus.OK, {"status": "ok"})
             return
+        page = self.server.extra_pages.get(path)
+        if page is not None:
+            self._send_bytes(
+                HTTPStatus.OK,
+                page.encode("utf-8"),
+                "text/html; charset=utf-8",
+            )
+            return
+        route = self.server.extra_json_get.get(path)
+        if route is not None:
+            self._run_route(route, {})
+            return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
@@ -107,37 +149,61 @@ class _PlaybackRequestHandler(BaseHTTPRequestHandler):
             "/api/evaluate": ("evaluate", "invalid_parameters", "evaluation_failed"),
         }
         operation = operations.get(path)
-        if operation is None:
+        extra = self.server.extra_json_post.get(path)
+        if operation is None and extra is None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
-        method = getattr(self.server.backend, operation[0], None)
-        if not callable(method):
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
-            return
+        if operation is not None:
+            method = getattr(self.server.backend, operation[0], None)
+            if not callable(method):
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                return
+            route = JsonRoute(
+                handler=method,
+                serialized=True,
+                invalid_error=operation[1],
+                failed_error=operation[2],
+            )
+        else:
+            route = extra
+        limit = 64 * 1024 if operation is not None else 4 * 1024 * 1024
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_length"})
             return
-        if length <= 0 or length > 64 * 1024:
+        if length <= 0 or length > limit:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_length"})
             return
         try:
             decoded = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(decoded, Mapping):
                 raise ValueError("request root must be an object")
-            with self.server.selection_lock:
-                result = method(decoded)
+        except (UnicodeDecodeError, ValueError) as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": route.invalid_error, "message": str(exc)},
+            )
+            return
+        self._run_route(route, decoded)
+
+    def _run_route(self, route: JsonRoute, payload: Mapping[str, object]) -> None:
+        try:
+            if route.serialized:
+                with self.server.selection_lock:
+                    result = route.handler(payload)
+            else:
+                result = route.handler(payload)
             self._send_json(HTTPStatus.OK, dict(result))
         except (KeyError, TypeError, ValueError) as exc:
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
-                {"error": operation[1], "message": str(exc)},
+                {"error": route.invalid_error, "message": str(exc)},
             )
         except Exception as exc:  # pragma: no cover - defensive server boundary
             self._send_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
-                {"error": operation[2], "message": str(exc)},
+                {"error": route.failed_error, "message": str(exc)},
             )
 
     def log_message(self, format: str, *args: object) -> None:
@@ -370,6 +436,43 @@ fetch("/api/catalog").then(r=>r.json()).then(data=>{{
 </body>
 </html>
 """
+
+
+_RESERVED_PATHS = frozenset(
+    {"/", "/healthz", "/api/catalog", "/api/select", "/api/evaluate"}
+)
+
+
+def _validated_pages(pages: Mapping[str, str] | None) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for path, body in (pages or {}).items():
+        _validate_route_path(path, "extra page")
+        if not isinstance(body, str) or not body:
+            raise ValueError(f"extra page {path} must be a non-empty string")
+        result[path] = body
+    return result
+
+
+def _validated_routes(
+    routes: Mapping[str, "JsonRoute"] | None,
+    name: str,
+) -> dict[str, "JsonRoute"]:
+    result: dict[str, JsonRoute] = {}
+    for path, route in (routes or {}).items():
+        _validate_route_path(path, name)
+        if not isinstance(route, JsonRoute):
+            raise TypeError(f"{name} entries must be JsonRoute instances")
+        result[path] = route
+    return result
+
+
+def _validate_route_path(path: object, name: str) -> None:
+    if not isinstance(path, str) or not path.startswith("/") or len(path) > 128:
+        raise ValueError(f"{name} path must be an absolute path under 128 characters")
+    if path in _RESERVED_PATHS:
+        raise ValueError(f"{name} path {path} is reserved by the legacy API")
+    if any(character in path for character in " ?#"):
+        raise ValueError(f"{name} path must not contain spaces, '?' or '#'")
 
 
 def _validate_meshcat_url(value: str) -> None:

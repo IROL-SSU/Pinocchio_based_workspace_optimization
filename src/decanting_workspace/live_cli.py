@@ -10,6 +10,7 @@ from io import StringIO
 import math
 from pathlib import Path
 import sys
+from threading import RLock
 import webbrowser
 
 import yaml
@@ -22,13 +23,15 @@ from .evaluation import EvaluationOptions
 from .kinematics import IKOptions
 from .live_backend import EvaluationProfile, LiveEvaluationBackend
 from .live_ui import build_live_control_page
-from .meshcat_ui import MeshcatControlServer
+from .meshcat_ui import JsonRoute, MeshcatControlServer
 from .models import SceneSpec, SceneState, default_config_path, load_scene_spec
 from .paths import repository_path
 from .precompute import CaseGrid, iter_case_keys
 from .precompute_cli import load_case_grid_yaml
 from .robots import RobotBundle, load_robot_bundle, resolve_official_ur20
 from .scene import materialize_scene
+from .study_backend import StudyEvaluationBackend
+from .study_ui import build_study_page
 from .viewer import CellViewer
 
 
@@ -45,6 +48,7 @@ class LiveDependencies:
     server_factory: Callable[..., MeshcatControlServer]
     browser_open: Callable[[str], object]
     prepared_sr12ia_resolver: Callable[[], Path] | None = None
+    study_backend_factory: Callable[..., object] = StudyEvaluationBackend
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -300,11 +304,34 @@ def main(
             approach_distance_m=args.approach_mm / 1000.0,
             keepout_margin_m=args.keepout_margin_mm / 1000.0,
         )
+        # One reentrant lock serializes every actual Pinocchio/viewer touch
+        # across the legacy live endpoints, the study request handlers and the
+        # study worker threads.  It is reentrant so a serialized route and the
+        # backend method it calls can both take it on the same thread.
+        compute_lock = RLock()
+        study_backend = deps.study_backend_factory(
+            spec,
+            initial_key,
+            ur_bundle,
+            sr_bundle,
+            viewer,
+            profiles={
+                profile.profile_id: profile.options for profile in profiles
+            },
+            default_profile=args.default_profile,
+            compute_lock=compute_lock,
+            approach_distance_m=args.approach_mm / 1000.0,
+            keepout_margin_m=args.keepout_margin_mm / 1000.0,
+            tote_present=grid.tote_present,
+        )
         server = deps.server_factory(
             (args.host, args.port),
             backend,
             viewer.url(),
             page_builder=build_live_control_page,
+            extra_pages={"/study": build_study_page(viewer.url())},
+            extra_json_post=_study_routes(study_backend),
+            selection_lock=compute_lock,
         )
 
         control_url = server.control_url
@@ -353,6 +380,113 @@ def main(
     finally:
         if server is not None:
             server.server_close()
+
+
+def _study_routes(backend: object) -> dict[str, JsonRoute]:
+    """Map the study JSON API onto the shared control server.
+
+    Only endpoints that actually touch Pinocchio or MeshCat are serialized.
+    Job control stays unserialized so progress and cancellation remain
+    responsive while a worker holds the compute lock for one check.
+    """
+
+    def route(
+        name: str,
+        *,
+        serialized: bool,
+        invalid: str,
+        failed: str,
+    ) -> JsonRoute:
+        handler = getattr(backend, name, None)
+        if not callable(handler):
+            raise RuntimeError(f"study backend has no {name} endpoint")
+        return JsonRoute(
+            handler=handler,
+            serialized=serialized,
+            invalid_error=invalid,
+            failed_error=failed,
+        )
+
+    return {
+        "/api/study/catalog": route(
+            "catalog",
+            serialized=True,
+            invalid="invalid_study_request",
+            failed="study_catalog_failed",
+        ),
+        "/api/study/validate": route(
+            "validate",
+            serialized=True,
+            invalid="invalid_study_recipe",
+            failed="study_validation_failed",
+        ),
+        "/api/study/preview": route(
+            "preview",
+            serialized=True,
+            invalid="invalid_study_recipe",
+            failed="study_preview_failed",
+        ),
+        "/api/study/preview/clear": route(
+            "clear_preview",
+            serialized=True,
+            invalid="invalid_study_request",
+            failed="study_preview_failed",
+        ),
+        "/api/study/recipe/save": route(
+            "save_recipe",
+            serialized=True,
+            invalid="invalid_study_recipe",
+            failed="study_save_failed",
+        ),
+        "/api/study/recipe/load": route(
+            "load_recipe",
+            serialized=True,
+            invalid="invalid_study_recipe",
+            failed="study_load_failed",
+        ),
+        "/api/study/recipe/import": route(
+            "import_recipe",
+            serialized=True,
+            invalid="invalid_study_recipe",
+            failed="study_import_failed",
+        ),
+        "/api/study/recipe/list": route(
+            "list_recipes",
+            serialized=False,
+            invalid="invalid_study_request",
+            failed="study_list_failed",
+        ),
+        "/api/study/evaluate": route(
+            "start_evaluation",
+            serialized=True,
+            invalid="invalid_study_recipe",
+            failed="study_evaluation_failed",
+        ),
+        "/api/study/scout": route(
+            "start_scout",
+            serialized=True,
+            invalid="invalid_study_recipe",
+            failed="study_scout_failed",
+        ),
+        "/api/study/job": route(
+            "job_status",
+            serialized=False,
+            invalid="invalid_study_request",
+            failed="study_job_failed",
+        ),
+        "/api/study/cancel": route(
+            "cancel_job",
+            serialized=False,
+            invalid="invalid_study_request",
+            failed="study_cancel_failed",
+        ),
+        "/api/study/show": route(
+            "show_configuration",
+            serialized=True,
+            invalid="invalid_study_request",
+            failed="study_show_failed",
+        ),
+    }
 
 
 def default_initial_grid_path() -> Path:

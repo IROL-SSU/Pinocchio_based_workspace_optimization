@@ -211,3 +211,8 @@ AMENT_IGNORE
 USD/Collected_scene_layout
 USD/Collected_scene_layout.zip
 USD/cu_usd_simplified.usd
+# User-authored study recipes saved by the /study GUI at run time.
+outputs/study_recipes/
+
+# Local agent scratch space and developer handoff notes.
+.codex/

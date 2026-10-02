@@ -345,6 +345,28 @@ def interpolate_rigid_poses(
     return tuple(result)
 
 
+def evaluate_linear_check(
+    snapshot: SceneSnapshot,
+    bundle: RobotBundle,
+    check: LinearPoseCheck,
+    checker: PinocchioCollisionChecker,
+    initial_seeds: Sequence[Sequence[float]],
+    options: EvaluationOptions,
+) -> tuple[LinearCheckResult, np.ndarray | None]:
+    """Evaluate exactly one pose segment with a caller-supplied phase checker.
+
+    This is the same routine :func:`evaluate_task_sequence` uses for every
+    generated check.  It is exported so a user-authored study can evaluate
+    individual checks without reproducing the sampling, seeding, and
+    joint-segment rules, and therefore without drifting from the default
+    process evaluation.
+    """
+
+    return _evaluate_linear_check(
+        snapshot, bundle, check, checker, initial_seeds, options
+    )
+
+
 def _evaluate_linear_check(
     snapshot: SceneSnapshot,
     bundle: RobotBundle,

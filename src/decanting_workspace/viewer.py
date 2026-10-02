@@ -329,6 +329,108 @@ class CellViewer:
             )
             node.set_transform(matrix)
 
+    def render_study_markers(
+        self,
+        markers: Iterable[tuple[str, Sequence[Sequence[float]] | np.ndarray, int]] = (),
+        segments: Iterable[
+            tuple[str, Sequence[float], Sequence[float], int]
+        ] = (),
+        *,
+        axis_length_m: float = 0.12,
+    ) -> int:
+        """Replace the authored-check pose markers and straight-segment previews.
+
+        Markers are drawn as three World-oriented axes; a segment is the
+        straight TCP translation between one check's start and end pose.  This
+        is a display overlay only and never participates in collision input.
+        """
+
+        root = "decanting/study/markers"
+        self.viewer[root].delete()
+        if not math.isfinite(axis_length_m) or axis_length_m <= 0.0:
+            raise ValueError("axis_length_m must be finite and positive")
+        drawn = 0
+        for name, transform, color in markers:
+            matrix = np.asarray(transform, dtype=float)
+            if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
+                raise ValueError(f"study marker {name} needs a finite 4 x 4 transform")
+            _validate_overlay_color(color, f"study marker {name}")
+            node_name = _overlay_node_name(name)
+            origin = matrix[:3, 3]
+            for index, axis_name in enumerate(("x", "y", "z")):
+                endpoint = origin + axis_length_m * matrix[:3, index]
+                self._render_line_segments(
+                    f"{root}/{node_name}/axis_{axis_name}",
+                    np.column_stack((origin, endpoint)),
+                    color if index == 2 else (0xD14A3D, 0x3A9B55, 0x3478C5)[index],
+                    opacity=0.95,
+                    linewidth=3.0,
+                )
+            drawn += 1
+        for name, start, end, color in segments:
+            first = np.asarray(tuple(start), dtype=float).reshape(-1)
+            second = np.asarray(tuple(end), dtype=float).reshape(-1)
+            if first.size != 3 or second.size != 3:
+                raise ValueError(f"study segment {name} needs two XYZ points")
+            if not np.all(np.isfinite(first)) or not np.all(np.isfinite(second)):
+                raise ValueError(f"study segment {name} must be finite")
+            _validate_overlay_color(color, f"study segment {name}")
+            if float(np.linalg.norm(second - first)) <= 1e-9:
+                continue
+            self._render_line_segments(
+                f"{root}/{_overlay_node_name(name)}/segment",
+                np.column_stack((first, second)),
+                color,
+                opacity=0.9,
+                linewidth=2.0,
+            )
+            drawn += 1
+        return drawn
+
+    def render_study_target_highlight(
+        self,
+        boxes: Iterable[BoxPrimitive] = (),
+        meshes: Iterable[MeshObstacle] = (),
+        *,
+        color: int = 0xE8C33C,
+    ) -> int:
+        """Outline the selected collision targets without changing the scene."""
+
+        import meshcat.geometry as geometry
+
+        root = "decanting/study/targets"
+        self.viewer[root].delete()
+        _validate_overlay_color(color, "study highlight")
+        drawn = 0
+        for box in boxes:
+            self._render_line_segments(
+                f"{root}/box/{_overlay_node_name(box.name)}",
+                self._oriented_box_edge_segments(box),
+                color,
+                opacity=0.95,
+                linewidth=3.0,
+            )
+            drawn += 1
+        for mesh in meshes:
+            node = self.viewer[f"{root}/mesh/{_overlay_node_name(mesh.name)}"]
+            node.set_object(
+                geometry.TriangularMeshGeometry(
+                    np.asarray(mesh.vertices_m, dtype=float),
+                    np.asarray(mesh.triangles, dtype=np.int32),
+                ),
+                geometry.MeshLambertMaterial(
+                    color=color, transparent=True, opacity=0.45
+                ),
+            )
+            node.set_transform(np.eye(4))
+            drawn += 1
+        return drawn
+
+    def clear_study_overlays(self) -> None:
+        """Remove every study marker, segment and target highlight."""
+
+        self.viewer["decanting/study"].delete()
+
     def render_sr_keepout(self, box: BoxPrimitive | None) -> None:
         """Show or clear the cached simultaneous-work SR exclusion box."""
 
@@ -697,6 +799,24 @@ def _visible_environment_boxes(
             and box.role in {"box", "box_sample_alternative", "tote"}
         )
     )
+
+
+def _overlay_node_name(name: str) -> str:
+    """Return a MeshCat path component that cannot create extra nesting."""
+
+    text = str(name).strip()
+    if not text:
+        raise ValueError("overlay node name must not be empty")
+    safe = "".join(
+        character if character.isalnum() or character in "._-" else "_"
+        for character in text
+    )
+    return safe[:120]
+
+
+def _validate_overlay_color(color: object, name: str) -> None:
+    if isinstance(color, bool) or not isinstance(color, int) or not 0 <= color <= 0xFFFFFF:
+        raise ValueError(f"{name} color must be an RGB integer")
 
 
 def _rotation_x(angle_rad: float) -> np.ndarray:
