@@ -22,6 +22,8 @@ from decanting_workspace.study_backend import (
     _pose_to_6d,
     _scout_candidates,
     _scout_settings,
+    _study_result_payload,
+    check_outcome,
     relative_pose_6d,
 )
 from decanting_workspace.study_recipe import (
@@ -963,11 +965,19 @@ def test_a_partial_run_is_never_reported_as_feasible(inline_backend, baseline):
         {"recipe": baseline.payload(), "check_ids": wanted}
     )["job"]
     result = _run_to_completion(inline_backend, job["job_id"])["result"]
-    assert result["status"] == "unknown"
     assert result["certification"] == "none"
+    assert result["status"] != "study_feasible"
     assert result["complete"] is False
     assert len(result["unevaluated_hard_check_ids"]) > 0
+    # However the run ends, a partial study must say so in its own headline.
     assert "not calculated" in result["headline"]
+    # The aggregate follows the one evaluated check exactly: an actual
+    # collision witness settles it as infeasible, while an exhausted IK search
+    # or an uncalculated check can only ever be UNKNOWN.
+    outcome = result["checks"][0]["outcome"]
+    assert result["status"] == (
+        "study_infeasible" if outcome == "collision" else "unknown"
+    )
 
 
 def test_an_empty_hard_set_is_never_a_success(inline_backend, baseline):
@@ -1140,11 +1150,11 @@ def test_show_configuration_without_a_viewer_says_so(backend, assets):
 
 
 def test_missing_and_unknown_parameters_are_rejected(backend, baseline):
-    with pytest.raises(RecipeError, match="missing study parameters"):
+    with pytest.raises(RecipeError, match="missing the effective case keys"):
         backend.catalog({"parameters": {"ur_x": 0.0}})
     payload = dict(baseline.parameters)
     payload["surprise"] = 1
-    with pytest.raises(RecipeError, match="unknown study parameters"):
+    with pytest.raises(RecipeError, match="unknown case keys"):
         backend.catalog({"parameters": payload})
 
 
@@ -1184,9 +1194,9 @@ def test_changed_parameters_regenerate_the_workflow_poses(backend, baseline):
     assert len(payload["checks"]) == 1
     original = backend.validate({"recipe": payload})["resolved_checks"][0]
 
-    moved = dict(baseline.parameters)
+    moved = dict(payload["parameters"])
     moved["ur_x"] = float(moved["ur_x"]) + 3.0
-    shifted = backend.validate({"recipe": payload, "parameters": moved})[
+    shifted = backend.validate({"recipe": {**payload, "parameters": moved}})[
         "resolved_checks"
     ][0]
     assert shifted["world_start"] != original["world_start"]
@@ -1202,12 +1212,30 @@ def test_a_base_independent_generated_pose_stays_fixed(backend, baseline):
         if item["template"]["check_name"] == "pallet_box_approach"
     ]
     original = backend.validate({"recipe": payload})["resolved_checks"][0]
-    moved = dict(baseline.parameters)
+    moved = dict(payload["parameters"])
     moved["ur_y"] = float(moved["ur_y"]) + 0.10
-    shifted = backend.validate({"recipe": payload, "parameters": moved})[
+    shifted = backend.validate({"recipe": {**payload, "parameters": moved}})[
         "resolved_checks"
     ][0]
     assert shifted["world_start"] == original["world_start"]
+
+
+def test_a_request_may_not_override_the_recipes_effective_case(backend, baseline):
+    # The case is hashed into recipe_hash, so computing one case while
+    # reporting another recipe's hash would make the result unattributable.
+    payload = baseline.payload()
+    conflicting = dict(payload["parameters"])
+    conflicting["ur_x"] = float(conflicting["ur_x"]) + 1.0
+    with pytest.raises(RecipeError, match="conflict with recipe"):
+        backend.validate({"recipe": payload, "parameters": conflicting})
+    # An identical echo is accepted, because it names the same case.
+    echoed = backend.validate(
+        {"recipe": payload, "parameters": dict(payload["parameters"])}
+    )
+    assert echoed["recipe_hash"] == baseline.recipe_hash
+    assert echoed["effective"]["parameters"]["ur_x"] == pytest.approx(
+        float(payload["parameters"]["ur_x"])
+    )
 
 
 def test_a_request_without_a_recipe_is_rejected(backend):
@@ -1231,6 +1259,27 @@ class _RecordingViewer:
         self.segments = None
         self.highlight = None
         self.cleared = 0
+        self.scene_updates: list[tuple[str, ...]] = []
+        self.payloads: list[tuple[bool, list[str]]] = []
+        self.framed = 0
+
+    def update_scene(self, spec, snapshot, *, hide_object_names=(), **kwargs) -> None:
+        self.scene_updates.append(tuple(hide_object_names))
+
+    def render_study_payload(self, objects=(), *, evaluated: bool) -> int:
+        drawn = list(objects)
+        self.payloads.append((evaluated, drawn))
+        return len(drawn)
+
+    def frame_scene(self, spec, snapshot, **kwargs) -> dict:
+        self.framed += 1
+        return {
+            "center_x_m": 0.0,
+            "center_y_m": 0.0,
+            "center_z_m": 0.0,
+            "radius_m": 1.0,
+            "distance_m": 2.0,
+        }
 
     def render_study_markers(self, markers=(), segments=(), **kwargs) -> int:
         self.markers = list(markers)
@@ -1413,8 +1462,9 @@ def test_scout_candidate_outside_the_floor_is_rejected_not_crashed(
             "recipe": payload,
             "scout": {
                 "mode": "grid",
-                # A base far outside the installation region still resolves
-                # geometrically; placement feasibility is not asserted here.
+                # A base far outside the installation region must be refused
+                # by the original installation gate, before any IK cost, and
+                # it must never reach any ranking.
                 "x_range_m": [40.0, 40.0],
                 "counts": [1, 1, 1, 1],
                 "max_candidates": 1,
@@ -1423,5 +1473,604 @@ def test_scout_candidate_outside_the_floor_is_rejected_not_crashed(
     )["job"]
     result = _run_to_completion(inline_backend, job["job_id"])["result"]
     row = result["candidates"][0]
-    assert row["status"] in {"feasible", "infeasible", "rejected"}
+    assert row["status"] == "installation_invalid"
+    assert row["installation"]["valid"] is False
+    assert row["installation"]["issues"]
+    assert row["evaluated_checks"] == 0
+    assert row["worst_normalized_min_singular_value"] == 0.0
+    assert result["ranking"] == []
+    assert result["ranking_strict"] == []
+    assert result["ranking_diagnostic"] == []
     json.dumps(result, allow_nan=False)
+
+
+# ====================================== effective case, gates and overlays
+#
+# Everything below covers behaviour the study gained after its first
+# implementation: the recipe owns its own effective case, the original
+# installation check stays independent of any collision scenario, an
+# exhausted IK search is distinguished from an actual collision witness, and
+# the 3-D overlay has to agree with the phase it claims to show.
+
+
+def _pose_matrix(payload: dict) -> np.ndarray:
+    return Pose6D(**payload).matrix()
+
+
+def _single_check_payload(baseline: StudyRecipe, check_name: str) -> dict:
+    payload = baseline.payload()
+    payload["checks"] = [
+        item
+        for item in payload["checks"]
+        if item["template"] is not None
+        and item["template"]["check_name"] == check_name
+    ]
+    assert len(payload["checks"]) == 1, check_name
+    return payload
+
+
+def _moved_case(payload: dict, **changes) -> dict:
+    return {**payload, "parameters": {**payload["parameters"], **changes}}
+
+
+class _RecordingPlayback:
+    """Stand in for the MeshCat playback so no robot mesh has to load."""
+
+    def __init__(self) -> None:
+        self.displayed: list[np.ndarray] = []
+
+    def display_configuration(self, q) -> None:
+        self.displayed.append(np.asarray(q, dtype=float))
+
+    def hide_ellipsoid(self) -> None:
+        return None
+
+
+# ------------------------------------------------- result status ladder
+
+
+def test_check_outcome_separates_a_collision_witness_from_an_unresolved_search():
+    # Only an actual collision at an attempted pose or along an attempted
+    # segment is evidence of infeasibility.  An exhausted deterministic IK
+    # search proves nothing, so it must never map onto "collision".
+    assert check_outcome("success") == "success"
+    assert check_outcome("solution_in_collision") == "collision"
+    assert check_outcome("joint_segment_collision") == "collision"
+    assert check_outcome("ik_not_found") == "unresolved"
+    # An unrecognised status is unresolved, never a success and never a
+    # collision claim the evaluator did not actually make.
+    assert check_outcome("some_future_status") == "unresolved"
+
+
+def _ladder_result(recipe, context, entries):
+    return _study_result_payload(
+        recipe=recipe,
+        context=context,
+        entries=entries,
+        coverage={
+            "omitted_generated_hard_checks": [],
+            "downgraded_generated_hard_checks": [],
+            "skipped_process_steps": [],
+        },
+        diagnostic={"weakened_collision_contract": False, "reasons": []},
+        evaluated_ids=[str(entry["check_id"]) for entry in entries],
+        selected_ids=None,
+        cancelled=False,
+        fingerprint_override=False,
+        elapsed_seconds=0.1,
+        options=QUICK,
+    )
+
+
+@pytest.fixture
+def ladder(backend, baseline):
+    """One HARD check plus the context of its own effective case."""
+
+    payload = _single_check_payload(baseline, "pallet_box_approach")
+    recipe = StudyRecipe.from_mapping(payload)
+    context = backend._workflow_context(
+        recipe.parameters, approach_distance_m=recipe.approach_distance_m
+    )
+    return recipe, context, recipe.checks[0].check_id
+
+
+def test_every_hard_check_succeeding_at_a_valid_base_is_study_feasible(ladder):
+    recipe, context, check_id = ladder
+    assert context.placement.valid is True
+    result = _ladder_result(
+        recipe,
+        context,
+        [{"check_id": check_id, "success": True, "outcome": "success"}],
+    )
+    assert result["status"] == "study_feasible"
+    assert result["certification"] == "study_feasible"
+
+
+def test_a_collision_witness_is_infeasible_but_an_exhausted_search_is_unknown(
+    ladder,
+):
+    recipe, context, check_id = ladder
+    collided = _ladder_result(
+        recipe,
+        context,
+        [
+            {
+                "check_id": check_id,
+                "success": False,
+                "outcome": "collision",
+            }
+        ],
+    )
+    assert collided["status"] == "study_infeasible"
+    assert collided["collision_hard_check_ids"] == [check_id]
+    assert collided["unresolved_hard_check_ids"] == []
+
+    unresolved = _ladder_result(
+        recipe,
+        context,
+        [
+            {
+                "check_id": check_id,
+                "success": False,
+                "outcome": "unresolved",
+            }
+        ],
+    )
+    assert unresolved["status"] == "unknown"
+    assert unresolved["certification"] == "none"
+    assert unresolved["unresolved_hard_check_ids"] == [check_id]
+    assert unresolved["collision_hard_check_ids"] == []
+    assert "proof that no solution exists" in unresolved["headline"]
+
+
+def test_an_installation_invalid_base_can_never_be_certified(backend, baseline):
+    # Every HARD check passing is not enough: the original installation gate
+    # is a separate, geometric precondition and a collision scenario cannot
+    # waive it.
+    payload = _moved_case(
+        _single_check_payload(baseline, "pallet_box_approach"), ur_x=40.0
+    )
+    recipe = StudyRecipe.from_mapping(payload)
+    context = backend._workflow_context(
+        recipe.parameters, approach_distance_m=recipe.approach_distance_m
+    )
+    assert context.placement.valid is False
+    result = _ladder_result(
+        recipe,
+        context,
+        [
+            {
+                "check_id": recipe.checks[0].check_id,
+                "success": True,
+                "outcome": "success",
+            }
+        ],
+    )
+    assert result["status"] == "installation_invalid"
+    assert result["certification"] == "none"
+    assert result["installation"]["valid"] is False
+    assert result["installation"]["issues"]
+    assert "installation" in result["headline"]
+
+
+def test_a_fingerprint_override_can_never_be_certified(ladder):
+    recipe, context, check_id = ladder
+    result = _study_result_payload(
+        recipe=recipe,
+        context=context,
+        entries=[{"check_id": check_id, "success": True, "outcome": "success"}],
+        coverage={
+            "omitted_generated_hard_checks": [],
+            "downgraded_generated_hard_checks": [],
+            "skipped_process_steps": [],
+        },
+        diagnostic={"weakened_collision_contract": False, "reasons": []},
+        evaluated_ids=[check_id],
+        selected_ids=None,
+        cancelled=False,
+        fingerprint_override=True,
+        elapsed_seconds=0.1,
+        options=QUICK,
+    )
+    assert result["status"] == "study_feasible_diagnostic"
+    assert result["certification"] == "study_feasible_diagnostic"
+
+
+# ------------------------------------------- installation is independent
+
+
+def test_installation_validity_ignores_every_collision_scenario(
+    backend, baseline
+):
+    # Excluding targets, exempting contacts and switching the floor and self
+    # collision off must not change the installation verdict, because that
+    # verdict comes from scene geometry alone.
+    payload = _single_check_payload(baseline, "pallet_box_approach")
+    strict = backend.validate({"recipe": payload})
+    assert strict["installation"]["valid"] is True
+
+    weakened = _two_scenario_payload(
+        baseline,
+        excluded_targets=["pallet", "ur20_pedestal"],
+        extra_allowed_contacts=[["suction_pad", "pallet"]],
+        include_floor=False,
+        include_self_collision=False,
+    )
+    weakened["checks"][0]["scenario_id"] = "probe"
+    report = backend.validate({"recipe": weakened})
+    assert report["installation"] == strict["installation"]
+    # The weakening is still reported, just not as an installation verdict.
+    assert report["diagnostic"]["weakened_collision_contract"] is True
+
+    # An out-of-region base is refused even with everything excluded.
+    moved = _moved_case(weakened, ur_x=40.0)
+    assert backend.validate({"recipe": moved})["installation"]["valid"] is False
+
+
+def test_an_unknown_excluded_collision_target_is_rejected(backend, baseline):
+    # A misspelled exclusion must not read as an applied diagnostic that
+    # happened to change nothing.
+    payload = _two_scenario_payload(
+        baseline, excluded_targets=["palet", "pallet"]
+    )
+    payload["checks"][0]["scenario_id"] = "probe"
+    with pytest.raises(RecipeError, match="do not exist in this scene"):
+        backend.validate({"recipe": payload})
+    # The correctly spelled name on its own is accepted.
+    payload["scenarios"][1]["excluded_targets"] = ["pallet"]
+    assert backend.validate({"recipe": payload})["resolved_checks"][0][
+        "excluded_targets_applied"
+    ] == ["pallet"]
+
+
+def test_downgrading_a_generated_hard_check_to_soft_leaves_it_uncovered(
+    backend, baseline
+):
+    # A HARD check that is kept but downgraded to SOFT no longer gates the
+    # result, so it must count as uncovered exactly like a deleted one.
+    payload = baseline.payload()
+    target = next(
+        item for item in payload["checks"] if item["criticality"] == "hard"
+    )
+    token = f"{target['template']['step_index']}:{target['template']['check_name']}"
+    payload["checks"] = [
+        {**item, "criticality": "soft"} if item is target else item
+        for item in payload["checks"]
+    ]
+    report = backend.validate({"recipe": payload})
+    coverage = report["coverage"]
+    assert token in coverage["downgraded_generated_hard_checks"]
+    assert token in coverage["omitted_generated_hard_checks"]
+    assert coverage["covers_generated_hard_set"] is False
+    assert any(
+        "downgraded to SOFT" in reason
+        for reason in report["diagnostic"]["reasons"]
+    )
+
+
+# --------------------------------------- the effective case round-trips
+
+
+def test_catalog_honours_an_approach_distance_override(backend, baseline):
+    default = backend.catalog({})
+    assert default["approach_distance_m"] == default["startup_approach_distance_m"]
+
+    further = backend.catalog(
+        {
+            "parameters": dict(baseline.parameters),
+            "approach_distance_m": default["approach_distance_m"] + 0.05,
+        }
+    )
+    assert further["approach_distance_m"] == pytest.approx(
+        default["approach_distance_m"] + 0.05
+    )
+    # The startup value is reported separately, so the UI can always show what
+    # the session was launched with.
+    assert further["startup_approach_distance_m"] == pytest.approx(
+        default["startup_approach_distance_m"]
+    )
+    assert further["baseline_recipe"]["approach_distance_m"] == pytest.approx(
+        default["approach_distance_m"] + 0.05
+    )
+    # A longer approach moves the generated approach poses, so the baseline
+    # recipe is genuinely a different study.
+    assert (
+        further["baseline_recipe"]["parameters"]
+        == default["baseline_recipe"]["parameters"]
+    )
+
+
+def test_saving_round_trips_the_effective_case_and_approach_distance(
+    backend, baseline
+):
+    payload = _moved_case(baseline.payload(), ur_x=-1.25, sku="430060")
+    payload["recipe_id"] = "case-roundtrip"
+    payload["approach_distance_m"] = 0.123
+    saved = backend.save_recipe({"recipe": payload})
+    reloaded = backend.load_recipe({"recipe_id": "case-roundtrip"})
+
+    assert reloaded["recipe"]["parameters"] == payload["parameters"]
+    assert reloaded["recipe"]["approach_distance_m"] == pytest.approx(0.123)
+    assert reloaded["recipe_hash"] == saved["recipe_hash"]
+    # The hash follows the case, so the stored result can never be read
+    # against a different one.
+    assert saved["recipe_hash"] != baseline.recipe_hash
+
+    report = backend.validate({"recipe": reloaded["recipe"]})
+    assert report["effective"]["approach_distance_m"] == pytest.approx(0.123)
+    assert report["effective"]["parameters"]["sku"] == "430060"
+    assert report["effective"]["parameters"]["ur_x"] == pytest.approx(-1.25)
+
+
+# ------------------------------------------------- camera and overlays
+
+
+def test_frame_cell_recentres_the_shared_camera(assets, tmp_path, baseline):
+    viewer = _RecordingViewer()
+    backend = _backend(assets, tmp_path, viewer=viewer)
+    result = backend.frame_cell({"parameters": dict(baseline.parameters)})
+    assert result["framed"] is True
+    assert viewer.framed == 1
+    assert set(result["camera"]) >= {"center_x_m", "center_y_m", "distance_m"}
+    assert result["parameters"]["ur_x"] == pytest.approx(
+        float(baseline.parameters["ur_x"])
+    )
+    # Framing is camera-only: it must not redraw the scene.
+    assert viewer.scene_updates == []
+
+
+def test_frame_cell_without_a_viewer_says_so(backend):
+    result = backend.frame_cell({})
+    assert result["framed"] is False
+
+
+def test_frame_scene_centres_on_the_cell_not_the_world_origin(assets):
+    from decanting_workspace.models import SceneState
+    from decanting_workspace.scene import materialize_scene
+    from decanting_workspace.viewer import _scene_bounds
+
+    key = assets.key
+    snapshot = materialize_scene(
+        assets.spec,
+        SceneState(
+            lift_height_m=key.lift_height_m,
+            sku=key.sku,
+            corner_samples=(key.corner,),
+            tote_long_axis_offset_m=key.tote_offset_m,
+            sr_j3_stroke_m=key.sr_j3_stroke_m,
+        ),
+        ur_base=key.ur_base,
+        sr_base=key.sr_base,
+    )
+    center, radius = _scene_bounds(assets.spec, snapshot)
+    assert np.all(np.isfinite(center)) and math.isfinite(radius)
+    assert radius > 0.0
+    # The cell sits metres away from the World origin, which is exactly why a
+    # default camera shows empty floor.
+    assert float(np.linalg.norm(center)) > 1.0
+    # Every rendered box has to fall inside the reported bounding sphere.
+    for box in snapshot.boxes:
+        offset = np.asarray(box.center_m, dtype=float) - center
+        assert float(np.linalg.norm(offset)) <= radius + 1e-6
+
+
+def test_preview_puts_the_payload_on_the_authored_tcp_and_hides_the_nominal_copy(
+    assets, tmp_path, baseline
+):
+    viewer = _RecordingViewer()
+    backend = _backend(assets, tmp_path, viewer=viewer)
+    payload = _single_check_payload(baseline, "pallet_box_lift")
+    resolved = backend.validate({"recipe": payload})["resolved_checks"][0]
+    carried = next(
+        item for item in resolved["payload_objects"] if item["attached_to_tcp"]
+    )
+
+    result = backend.preview({"recipe": payload})
+    assert result["payload_display"] == "schematic_authored_start"
+    assert result["payload_boxes"] >= 1
+    assert "not an evaluated joint solution" in result["payload_note"]
+    # The carried carton is removed from the nominal scene, so it cannot be
+    # shown twice: once in its pallet slot and once on the TCP.
+    assert carried["name"] in result["hidden_snapshot_objects"]
+    assert viewer.scene_updates == [tuple(result["hidden_snapshot_objects"])]
+
+    evaluated, drawn = viewer.payloads[-1]
+    assert evaluated is False
+    expected = _pose_matrix(resolved["world_start"]) @ _pose_matrix(
+        carried["tcp_relative"]
+    )
+    actual = next(
+        transform for name, _size, transform in drawn if name == carried["name"]
+    )
+    assert np.allclose(np.asarray(actual, dtype=float), expected, atol=1e-7)
+
+
+def test_preview_of_several_checks_keeps_the_nominal_scene_and_draws_no_payload(
+    assets, tmp_path, baseline
+):
+    # Several checks have no single collision phase, so showing one check's
+    # moving objects for all of them would be a false picture.
+    viewer = _RecordingViewer()
+    backend = _backend(assets, tmp_path, viewer=viewer)
+    payload = baseline.payload()
+    payload["checks"] = payload["checks"][:3]
+    result = backend.preview({"recipe": payload})
+    assert result["payload_display"] == "none"
+    assert result["payload_boxes"] == 0
+    assert result["hidden_snapshot_objects"] == []
+    assert viewer.scene_updates == [()]
+    assert "nominal scene positions" in result["payload_note"]
+
+
+def test_preview_frames_the_cell_only_when_asked(assets, tmp_path, baseline):
+    viewer = _RecordingViewer()
+    backend = _backend(assets, tmp_path, viewer=viewer)
+    payload = baseline.payload()
+    payload["checks"] = payload["checks"][:1]
+    assert backend.preview({"recipe": payload})["camera"] is None
+    assert viewer.framed == 0
+    framed = backend.preview({"recipe": payload, "frame_cell": True})
+    assert framed["camera"] is not None
+    assert viewer.framed == 1
+
+
+def test_show_configuration_places_the_payload_on_the_solved_tcp(
+    assets, tmp_path, baseline
+):
+    from decanting_workspace.kinematics import frame_pose
+    from decanting_workspace.robots import floating_configuration
+
+    viewer = _RecordingViewer()
+    backend = _backend(assets, tmp_path, viewer=viewer)
+    backend._playback = _RecordingPlayback()
+    payload = _single_check_payload(baseline, "pallet_box_lift")
+    resolved = backend.validate({"recipe": payload})["resolved_checks"][0]
+    carried = next(
+        item for item in resolved["payload_objects"] if item["attached_to_tcp"]
+    )
+    check_id = resolved["check_id"]
+
+    q = floating_configuration(
+        assets.ur,
+        BasePose(
+            x_m=float(baseline.parameters["ur_x"]),
+            y_m=float(baseline.parameters["ur_y"]),
+            z_m=float(baseline.parameters["ur_z"]),
+            yaw_deg=float(baseline.parameters["ur_yaw"]),
+        ),
+        assets.spec.robots["ur20"].nominal_q,
+    )
+    result = backend.show_configuration(
+        {"recipe": payload, "check_id": check_id, "q": [float(v) for v in q]}
+    )
+    assert result["displayed"] is True
+    assert result["payload_display"] == "evaluated_solved_pose"
+    assert result["payload_boxes"] >= 1
+
+    evaluated, drawn = viewer.payloads[-1]
+    assert evaluated is True
+    world_T_tcp = frame_pose(assets.ur, q, "suction_tcp")
+    expected = world_T_tcp @ _pose_matrix(carried["tcp_relative"])
+    actual = next(
+        transform for name, _size, transform in drawn if name == carried["name"]
+    )
+    assert np.allclose(np.asarray(actual, dtype=float), expected, atol=1e-7)
+    # The authored schematic box must not survive next to an evaluated one.
+    assert [entry[0] for entry in viewer.payloads] == [True]
+    # The nominal copy of the carried carton is hidden here too.
+    assert carried["name"] in viewer.scene_updates[-1]
+
+
+def test_show_configuration_without_a_check_clears_any_schematic_payload(
+    assets, tmp_path
+):
+    viewer = _RecordingViewer()
+    backend = _backend(assets, tmp_path, viewer=viewer)
+    backend._playback = _RecordingPlayback()
+    nq = int(assets.ur.model.nq)
+    q = [0.0] * nq
+    q[6] = 1.0  # unit quaternion for the free-flyer root
+    result = backend.show_configuration({"q": q})
+    assert result["displayed"] is True
+    assert result["payload_display"] == "none"
+    assert viewer.payloads == [(True, [])]
+    # No recipe was supplied, so the scene must not be re-materialized.
+    assert viewer.scene_updates == []
+
+
+def test_a_non_reentrant_compute_lock_is_refused(assets, tmp_path):
+    # The study re-enters the shared lock, so a plain Lock would deadlock the
+    # whole server rather than fail visibly.
+    with pytest.raises(ValueError, match="reentrant"):
+        StudyEvaluationBackend(
+            assets.spec,
+            assets.key,
+            assets.ur,
+            assets.sr,
+            None,
+            profiles={"quick": QUICK},
+            default_profile="quick",
+            store=StudyRecipeStore(tmp_path),
+            compute_lock=threading.Lock(),
+        )
+    backend = StudyEvaluationBackend(
+        assets.spec,
+        assets.key,
+        assets.ur,
+        assets.sr,
+        None,
+        profiles={"quick": QUICK},
+        default_profile="quick",
+        store=StudyRecipeStore(tmp_path),
+        compute_lock=threading.RLock(),
+    )
+    assert backend.catalog({})["schema_version"] >= 1
+
+
+# ------------------------------- payload-only template contact inheritance
+
+
+def test_a_payload_only_template_inherits_its_carried_contacts_with_provenance(
+    catalog,
+):
+    # A step such as 6 carries object state but generates no pose check of its
+    # own, so its intended contacts have to be recovered from the step that
+    # actually grasped the same payload instance.  Without this an authored
+    # pouring probe would collision-check its own carried carton against the
+    # support it is being poured over.
+    template = next(
+        item for item in catalog["templates"] if item["token"] == "step_objects:6"
+    )
+    carried = next(
+        name for name in template["object_names"] if name.startswith("box_")
+    )
+    contacts = {tuple(pair) for pair in template["allowed_contacts"]}
+    assert tuple(sorted(("suction_pad", carried))) in contacts
+    provenance = template["contact_provenance"]
+    assert any("grasp contact" in entry for entry in provenance)
+    assert any("same carried payload" in entry for entry in provenance)
+    # Every reported pair must be traceable, never anonymous.
+    assert len(provenance) >= 1
+
+
+def test_a_payload_only_template_without_an_attached_object_inherits_nothing(
+    catalog,
+):
+    # Identity matching is what keeps the inheritance narrow: a step whose
+    # object state is not TCP-coupled must not pick up another phase's
+    # exemptions just because an object shares its name.
+    for token in ("step_objects:5", "step_objects:8"):
+        template = next(
+            item for item in catalog["templates"] if item["token"] == token
+        )
+        assert template["allowed_contacts"] == [], token
+        assert template["contact_provenance"] == [], token
+
+
+def test_inherited_contacts_reach_the_resolved_phase_of_an_authored_probe(
+    backend, baseline, catalog
+):
+    template = next(
+        item for item in catalog["templates"] if item["token"] == "step_objects:6"
+    )
+    payload = baseline.payload()
+    payload["checks"] = [
+        {
+            **payload["checks"][0],
+            "check_id": "pour-probe",
+            "criticality": "soft",
+            "pose_mode": "absolute",
+            "payload_source": "template",
+            "template": template["reference"],
+            "reference_frame": "world",
+            "start_pose": Pose6D(x_m=-1.0, y_m=-7.0, z_m=1.4).payload(),
+            "end_pose": Pose6D(x_m=-1.0, y_m=-7.0, z_m=1.4).payload(),
+        }
+    ]
+    resolved = backend.validate({"recipe": payload})["resolved_checks"][0]
+    intended = {tuple(pair) for pair in resolved["allowed_contacts"]}
+    exempt = {tuple(pair) for pair in resolved["phase_allowed_contacts"]}
+    assert intended == {tuple(pair) for pair in template["allowed_contacts"]}
+    # What the checker actually exempts must cover the intended set, so the
+    # two reported lists can never disagree silently.
+    assert intended <= exempt

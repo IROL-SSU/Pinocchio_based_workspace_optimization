@@ -24,7 +24,7 @@ from .robots import (
     load_robot_bundle,
 )
 from .scene import SceneSnapshot, sr_cutting_workspace_footprint_box
-from .transforms import pose_matrix, quaternion_matrix
+from .transforms import pose_matrix, quaternion_matrix, yaw_matrix
 
 
 ROLE_STYLE: dict[str, tuple[int, float]] = {
@@ -163,6 +163,9 @@ class CellViewer:
                 sr_spec.cutter_proxy,
                 root_name="decanting/robots/sr12ia/provisional_cutter",
             )
+        # Open on the cell rather than on the World origin, which is several
+        # metres away and shows only empty floor.
+        self.frame_scene(spec, snapshot)
 
     def open(self) -> None:
         self.viewer.open()
@@ -237,12 +240,21 @@ class CellViewer:
         show_sr_cutting_workspace: bool = True,
         show_sr_footprint_fill: bool = True,
         suppress_process_objects: bool = False,
+        hide_object_names: Iterable[str] = (),
     ) -> None:
-        """Update case-dependent primitives without reloading either robot mesh."""
+        """Update case-dependent primitives without reloading either robot mesh.
+
+        ``hide_object_names`` removes exactly the named snapshot objects, which
+        is how a caller that re-draws one phase's moving objects itself keeps
+        the nominal copy from appearing twice.
+        """
 
         self.viewer["decanting/environment"].delete()
         boxes = _visible_environment_boxes(
-            spec, snapshot, suppress_process_objects=suppress_process_objects
+            spec,
+            snapshot,
+            suppress_process_objects=suppress_process_objects,
+            hide_object_names=hide_object_names,
         )
         self._render_floor(spec, boxes, snapshot.meshes)
         for box in boxes:
@@ -328,6 +340,103 @@ class CellViewer:
                 ),
             )
             node.set_transform(matrix)
+
+    def frame_scene(
+        self,
+        spec: SceneSpec,
+        snapshot: SceneSnapshot,
+        *,
+        margin_m: float = 1.6,
+    ) -> dict[str, float]:
+        """Point the camera at the cell instead of the World origin.
+
+        A decanting cell sits several metres from the World origin, so the
+        default MeshCat camera shows empty floor.  This centres the view on
+        the actual scene bounds and keeps normal orbit interaction: only the
+        camera target and its offset are set.
+        """
+
+        center, radius = _scene_bounds(spec, snapshot)
+        distance = float(max(2.0, radius * 1.9 + margin_m))
+        self.focus_camera(center, distance)
+        return {
+            "center_x_m": float(center[0]),
+            "center_y_m": float(center[1]),
+            "center_z_m": float(center[2]),
+            "radius_m": float(radius),
+            "distance_m": distance,
+        }
+
+    def focus_camera(
+        self,
+        target_m: Sequence[float],
+        distance_m: float,
+    ) -> None:
+        """Set the orbit target and the camera offset around it."""
+
+        target = np.asarray(tuple(target_m), dtype=float).reshape(-1)
+        if target.size != 3 or not np.all(np.isfinite(target)):
+            raise ValueError("camera target must be a finite XYZ point")
+        distance = float(distance_m)
+        if not math.isfinite(distance) or distance <= 0.0:
+            raise ValueError("camera distance must be finite and positive")
+        # MeshCat orbits "/Cameras/default"; translating that node moves the
+        # orbit centre, and the child camera position is the offset from it.
+        # That child lives under "/rotated", which MeshCat's create_camera
+        # turns by +pi/2 about X, so a local offset (x, y, z) lands at world
+        # (x, -z, y).  The offset below is therefore the local spelling of the
+        # intended world vector (0.72, -0.72, 0.52) * distance: a three
+        # quarter view from above, not from under the floor.
+        self.viewer["/Cameras/default"].set_transform(pose_matrix(target))
+        self.viewer["/Cameras/default/rotated/<object>"].set_property(
+            "position",
+            [
+                float(0.72 * distance),
+                float(0.52 * distance),
+                float(0.72 * distance),
+            ],
+        )
+
+    def render_study_payload(
+        self,
+        objects: Iterable[tuple[str, Sequence[float], Sequence[Sequence[float]]]] = (),
+        *,
+        evaluated: bool,
+    ) -> int:
+        """Draw a study check's payload boxes, labelled by provenance.
+
+        ``evaluated=False`` is the schematic preview at the authored start
+        pose: it has no solved joint configuration behind it.  ``True`` is the
+        payload placed by an actually solved TCP pose.  Only one of the two is
+        ever present, so a stale schematic box cannot be mistaken for an
+        evaluated result.
+        """
+
+        import meshcat.geometry as geometry
+
+        root = "decanting/study/payload"
+        self.viewer[root].delete()
+        kind = "evaluated" if evaluated else "schematic"
+        color = 0x2F9E63 if evaluated else 0x8A8FA0
+        opacity = 0.62 if evaluated else 0.24
+        drawn = 0
+        for name, size_m, transform in objects:
+            matrix = np.asarray(transform, dtype=float)
+            size = np.asarray(tuple(size_m), dtype=float).reshape(-1)
+            if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
+                raise ValueError(f"study payload {name} needs a finite 4 x 4 transform")
+            if size.size != 3 or np.any(size <= 0.0) or not np.all(np.isfinite(size)):
+                raise ValueError(f"study payload {name} needs three positive sizes")
+            node = self.viewer[f"{root}/{kind}/{_overlay_node_name(name)}"]
+            node.set_object(
+                geometry.Box(size),
+                geometry.MeshLambertMaterial(
+                    color=color, transparent=True, opacity=opacity
+                ),
+            )
+            node.set_transform(matrix)
+            drawn += 1
+        return drawn
 
     def render_study_markers(
         self,
@@ -782,15 +891,18 @@ def _visible_environment_boxes(
     snapshot: SceneSnapshot,
     *,
     suppress_process_objects: bool = False,
+    hide_object_names: Iterable[str] = (),
 ) -> tuple[BoxPrimitive, ...]:
     """Keep workflow proxies available without displaying them over USD meshes."""
 
     mesh_names = {mesh.name for mesh in snapshot.meshes}
     static_names = {box.name for box in spec.static_boxes}
+    hidden = frozenset(hide_object_names)
     return tuple(
         box
         for box in snapshot.boxes
         if box.name not in mesh_names
+        and box.name not in hidden
         and not (
             snapshot.meshes and box.name in static_names and not box.collision_enabled
         )
@@ -799,6 +911,47 @@ def _visible_environment_boxes(
             and box.role in {"box", "box_sample_alternative", "tote"}
         )
     )
+
+
+def _scene_bounds(
+    spec: SceneSpec,
+    snapshot: SceneSnapshot,
+) -> tuple[np.ndarray, float]:
+    """Return the scene centre and its bounding radius in metres."""
+
+    lower: list[np.ndarray] = []
+    upper: list[np.ndarray] = []
+    for box in _visible_environment_boxes(spec, snapshot):
+        half = np.abs(
+            np.abs(yaw_matrix(math.radians(box.yaw_deg))[:3, :3])
+            @ (np.asarray(box.size_m, dtype=float) / 2.0)
+        )
+        center = np.asarray(box.center_m, dtype=float)
+        lower.append(center - half)
+        upper.append(center + half)
+    for mesh in snapshot.meshes:
+        vertices = np.asarray(mesh.vertices_m, dtype=float)
+        lower.append(vertices.min(axis=0))
+        upper.append(vertices.max(axis=0))
+    for base in (snapshot.ur_base, snapshot.sr_base):
+        point = np.asarray(base.xyz_m, dtype=float)
+        lower.append(point - 1.0)
+        upper.append(point + 1.0)
+    if not lower:
+        region = spec.installation_region
+        lower.append(
+            np.array((region.raw_xy_min_m[0], region.raw_xy_min_m[1], spec.floor_z_m))
+        )
+        upper.append(
+            np.array(
+                (region.raw_xy_max_m[0], region.raw_xy_max_m[1], spec.floor_z_m + 2.0)
+            )
+        )
+    minimum = np.min(np.vstack(lower), axis=0)
+    maximum = np.max(np.vstack(upper), axis=0)
+    center = (minimum + maximum) / 2.0
+    radius = float(np.linalg.norm(maximum - minimum) / 2.0)
+    return center, radius
 
 
 def _overlay_node_name(name: str) -> str:

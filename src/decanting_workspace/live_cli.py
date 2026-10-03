@@ -432,6 +432,12 @@ def _study_routes(backend: object) -> dict[str, JsonRoute]:
             invalid="invalid_study_request",
             failed="study_preview_failed",
         ),
+        "/api/study/frame": route(
+            "frame_cell",
+            serialized=True,
+            invalid="invalid_study_request",
+            failed="study_frame_failed",
+        ),
         "/api/study/recipe/save": route(
             "save_recipe",
             serialized=True,

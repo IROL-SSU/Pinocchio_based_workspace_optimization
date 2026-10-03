@@ -111,6 +111,22 @@ progress { width: 100%; height: 10px; }
     </fieldset>
 
     <fieldset>
+      <legend>Case parameters (the effective case, hashed into the recipe)</legend>
+      <p class="muted">이 값이 실제로 계산되는 case입니다. recipe에 저장되고 <code>recipe_hash</code>에 포함되므로, 불러온 recipe의 case가 조용히 시작값으로 바뀌지 않습니다. 변경하면 template/frame/target 목록을 다시 받아옵니다.</p>
+      <div id="caseControls"></div>
+      <label>Approach distance <span class="numeric-control"><input id="caseApproach" type="number" step="any"><span class="unit">mm</span></span></label>
+      <div class="row">
+        <button id="applyCase" type="button">Apply case &amp; refresh catalog</button>
+        <button id="revertCase" class="secondary" type="button">Revert to recipe</button>
+      </div>
+      <div class="row">
+        <button id="frameCell" class="secondary" type="button">Frame cell (reset camera)</button>
+        <button id="applyScoutBest" class="secondary" type="button" disabled>Apply best scout base</button>
+      </div>
+      <output id="caseStatus" class="result-box mono" aria-live="polite">—</output>
+    </fieldset>
+
+    <fieldset>
       <legend>Checks <span id="checkCount" class="muted"></span></legend>
       <div id="checkList" class="list" role="listbox" aria-label="Authored checks"></div>
       <div class="row">
@@ -163,9 +179,10 @@ progress { width: 100%; height: 10px; }
         <button id="removeScenario" class="danger" type="button">Remove scenario</button>
       </div>
       <label>Label <input id="scenarioLabel" type="text" maxlength="128"></label>
-      <label><span>Robot self collision</span><input id="scenarioSelf" type="checkbox"></label>
-      <label><span>Floor collision</span><input id="scenarioFloor" type="checkbox"></label>
+      <label><span>INCLUDE robot self collision</span><input id="scenarioSelf" type="checkbox"></label>
+      <label><span>INCLUDE floor collision</span><input id="scenarioFloor" type="checkbox"></label>
       <h2>Collision targets <span id="targetCount" class="muted"></span></h2>
+      <p class="warn" id="targetLegend">아래 목록의 체크 = <strong>EXCLUDED</strong> (checker 입력에서 제외). 위의 self/floor 체크는 반대로 <strong>INCLUDE</strong>입니다. 제외는 진단 실험이며 결과가 <code>study_feasible</code>로 확정되지 않습니다.</p>
       <label>Search <input id="targetSearch" type="search" placeholder="name / role / prim path"></label>
       <label>Role <select id="targetRole"></select></label>
       <div class="row3">
@@ -174,7 +191,6 @@ progress { width: 100%; height: 10px; }
         <button id="highlightShown" class="secondary" type="button">Highlight shown</button>
       </div>
       <div id="targetList" class="list"></div>
-      <p class="muted">체크한 target은 이 scenario에서 실제 checker 입력에서 제외됩니다. 제외는 진단 실험이며 결과가 <code>study_feasible</code>로 확정되지 않습니다.</p>
       <h2>Extra allowed contacts</h2>
       <div class="row">
         <input id="contactFirst" type="text" list="contactNames" placeholder="first name" spellcheck="false">
@@ -298,8 +314,157 @@ function recipePayload() {
   return copy;
 }
 
+const caseControls = new Map();
+
+function buildCaseControls() {
+  const container = el("caseControls");
+  container.replaceChildren();
+  caseControls.clear();
+  const schema = catalog.parameter_schema;
+  if (!schema || typeof schema !== "object") throw new Error("catalog has no parameter_schema");
+  for (const [key, definition] of Object.entries(schema)) {
+    const row = document.createElement("label");
+    const label = document.createElement("span");
+    label.textContent = definition.label ?? key;
+    row.dataset.caseKey = key;
+    let input;
+    if (definition.kind === "choice") {
+      input = document.createElement("select");
+      for (const option of definition.options ?? []) {
+        const node = document.createElement("option");
+        node.value = JSON.stringify(option.value);
+        node.textContent = String(option.label ?? option.value);
+        input.append(node);
+      }
+    } else {
+      const wrap = document.createElement("span");
+      wrap.className = "numeric-control";
+      input = document.createElement("input");
+      input.type = "number";
+      input.step = "any";
+      if (definition.nullable) input.placeholder = "default";
+      const unit = document.createElement("span");
+      unit.className = "unit";
+      unit.textContent = definition.unit ?? "";
+      wrap.append(input, unit);
+      row.append(label, wrap);
+      container.append(row);
+      caseControls.set(key, {definition, input});
+      input.addEventListener("change", () => markCaseEdited());
+      continue;
+    }
+    input.dataset.caseInput = key;
+    input.addEventListener("change", () => markCaseEdited());
+    row.append(label, input);
+    container.append(row);
+    caseControls.set(key, {definition, input});
+  }
+  el("caseApproach").addEventListener("change", () => markCaseEdited());
+  syncCaseControls();
+}
+
+function syncCaseControls() {
+  for (const [key, control] of caseControls) {
+    const stored = recipe.parameters[key];
+    if (control.definition.kind === "choice") {
+      control.input.value = JSON.stringify(stored);
+      continue;
+    }
+    const scale = Number(control.definition.ui_scale ?? 1);
+    control.input.value = stored === null || stored === undefined
+      ? "" : String(Number(stored) * scale);
+  }
+  el("caseApproach").value = String(recipe.approach_distance_m * 1000);
+  showCaseStatus("unknown", "현재 recipe의 case와 동일합니다.");
+}
+
+function readCaseControls() {
+  const parameters = {};
+  for (const [key, control] of caseControls) {
+    if (control.definition.kind === "choice") {
+      parameters[key] = JSON.parse(control.input.value);
+      continue;
+    }
+    const raw = control.input.value.trim();
+    if (raw === "") {
+      if (!control.definition.nullable) throw new Error(`${key} is required`);
+      parameters[key] = null;
+      continue;
+    }
+    const scale = Number(control.definition.ui_scale ?? 1);
+    const value = Number(raw) / scale;
+    if (!Number.isFinite(value)) throw new Error(`${key} must be a finite number`);
+    const min = Number(control.definition.min);
+    const max = Number(control.definition.max);
+    if (Number.isFinite(min) && Number.isFinite(max) && (value < min - 1e-9 || value > max + 1e-9)) {
+      throw new Error(`${control.definition.label ?? key} must be within [${min * scale}, ${max * scale}] ${control.definition.unit ?? ""}`);
+    }
+    parameters[key] = value;
+  }
+  const approach = Number(el("caseApproach").value) / 1000;
+  if (!Number.isFinite(approach) || approach <= 0) throw new Error("approach distance must be positive");
+  return {parameters, approach_distance_m: approach};
+}
+
+function markCaseEdited() {
+  showCaseStatus("diagnostic", "Case가 편집되었습니다. 'Apply case & refresh catalog'를 눌러 적용하세요.");
+}
+
+function showCaseStatus(level, message) {
+  setBox(el("caseStatus"), level, message);
+}
+
+async function applyCase() {
+  let wanted;
+  try {
+    wanted = readCaseControls();
+  } catch (error) {
+    showCaseStatus("failed", `Case 입력 오류: ${error.message}`);
+    return false;
+  }
+  const previousParameters = recipe.parameters;
+  const previousApproach = recipe.approach_distance_m;
+  recipe.parameters = wanted.parameters;
+  recipe.approach_distance_m = wanted.approach_distance_m;
+  if (!await refreshCatalogForRecipe()) {
+    // A case the server refuses must not be left inside the recipe: the
+    // recipe would then carry a case that cannot be evaluated or saved.
+    recipe.parameters = previousParameters;
+    recipe.approach_distance_m = previousApproach;
+    return false;
+  }
+  markRecipeChanged();
+  return true;
+}
+
+async function refreshCatalogForRecipe() {
+  try {
+    const refreshed = await postJson("/api/study/catalog", {
+      parameters: recipe.parameters,
+      approach_distance_m: recipe.approach_distance_m,
+    });
+    applyCatalog(refreshed);
+    renderAll();
+    const resolved = await refreshResolved();
+    const install = refreshed.installation;
+    showCaseStatus(install.valid ? "success" : "failed", [
+      `templates ${refreshed.templates.length} · targets ${refreshed.collision_targets.length} · frames ${refreshed.reference_frames.length}`,
+      `installation: ${install.valid ? "valid" : "INVALID"}${install.issues.length ? " · " + install.issues.map(i => i.code).join(", ") : ""}`,
+      `SR workspace: ${refreshed.sr_workspace.checked ? (refreshed.sr_workspace.feasible ? "feasible" : "infeasible") : "not checked"} (reported only)`,
+      `recipe_hash: ${resolved.recipe_hash.slice(0, 16)}…`,
+    ].join("\n"));
+    return true;
+  } catch (error) {
+    showCaseStatus("failed", `Catalog 갱신 실패: ${error.message}`);
+    return false;
+  }
+}
+
 function request(extra) {
-  return Object.assign({recipe: recipePayload(), parameters: catalog.parameters}, extra || {});
+  // The recipe carries its own effective case, so no separate parameter
+  // override is ever sent: the server would reject a conflicting one, and a
+  // silently applied one would detach the result from recipe_hash.
+  return Object.assign({recipe: recipePayload()}, extra || {});
 }
 
 function currentCheck() {
@@ -462,6 +627,11 @@ function uniqueId(base) {
   return candidate;
 }
 
+function templateProvenance(resolved) {
+  const entry = catalog?.templates?.find(item => item.token === resolved.template);
+  return entry?.contact_provenance;
+}
+
 function showResolved() {
   const resolved = resolvedByCheck.get(selectedCheckId);
   if (!resolved) { setBox(resolvedPose, "unknown", "Validate를 눌러 해석된 world pose를 확인하세요."); return; }
@@ -473,6 +643,7 @@ function showResolved() {
     `phase: ${resolved.obstacle_count} box + ${resolved.mesh_count} mesh obstacles, ${resolved.attached_count} attached`,
     `intended contacts (template): ${resolved.allowed_contacts.map(p => p.join(" ~ ")).join(", ") || "(none)"}`,
     `checker-exempt pairs (template + scenario): ${resolved.phase_allowed_contacts.map(p => p.join(" ~ ")).join(", ") || "(none beyond defaults)"}`,
+    `contact provenance: ${(templateProvenance(resolved) ?? []).join(" | ") || "(authored check)"}`,
     `payload: ${resolved.payload_objects.map(o => `${o.name}${o.attached_to_tcp ? " [attached]" : (o.follows_tcp ? " [follows]" : "")}`).join(", ") || "(free space)"}`,
     `floor: ${resolved.include_floor ? "on" : "OFF"} · self collision: ${resolved.include_self_collision ? "on" : "OFF"}`,
   ];
@@ -653,17 +824,35 @@ function showResult(result) {
   resultRecipeHash = result.recipe_hash;
   staleNote.innerHTML = "";
   if (result.kind === "scout") { showScoutResult(result); return; }
+  const effective = result.effective ?? {};
+  const parameters = effective.parameters ?? {};
+  const install = result.installation ?? {valid: null, issues: []};
   const lines = [
     `Status: ${result.status}`,
     `Certification: ${result.certification}`,
     result.headline,
     "",
-    `Evaluated: ${result.evaluated_check_ids.length} check(s) in ${Number(result.elapsed_seconds).toFixed(2)} s · profile ${result.profile}`,
-    `HARD: ${result.hard_check_ids.length} enabled, ${result.failed_hard_check_ids.length} failed, ${result.unevaluated_hard_check_ids.length} not calculated`,
+    `Effective case: UR20 x=${(parameters.ur_x * 1000).toFixed(0)} y=${(parameters.ur_y * 1000).toFixed(0)} z=${(parameters.ur_z * 1000).toFixed(0)} mm yaw=${parameters.ur_yaw} deg`,
+    `  SKU ${parameters.sku} · corner ${parameters.corner} · lift ${(parameters.lift * 1000).toFixed(0)} mm · tote ${(parameters.tote * 1000).toFixed(0)} mm · mode ${parameters.mode}`,
+    `  approach ${(Number(effective.approach_distance_m) * 1000).toFixed(0)} mm · profile ${result.profile}`,
+    `Installation (independent of collision scenarios): ${install.valid === null ? "n/a" : (install.valid ? "valid" : "INVALID")}` +
+      (install.issues && install.issues.length ? ` · ${install.issues.map(i => i.code).join(", ")}` : ""),
+    `SR cutting workspace (reported only, not part of this certification): ${result.sr_workspace?.checked ? (result.sr_workspace.feasible ? "feasible" : "infeasible") : "not checked"}`,
+    "",
+    `Evaluated: ${result.evaluated_check_ids.length} check(s) in ${Number(result.elapsed_seconds).toFixed(2)} s`,
+    `HARD: ${result.hard_check_ids.length} enabled · ${(result.collision_hard_check_ids ?? []).length} collision · ${(result.unresolved_hard_check_ids ?? []).length} unresolved (ik_not_found) · ${result.unevaluated_hard_check_ids.length} not calculated`,
     `SOFT failures: ${result.failed_soft_check_ids.join(", ") || "none"}`,
     `Generated HARD coverage: ${result.coverage.covers_generated_hard_set ? "complete" : "partial"} (omitted: ${result.coverage.omitted_generated_hard_checks.join(", ") || "none"})`,
+    `  downgraded to SOFT: ${(result.coverage.downgraded_generated_hard_checks ?? []).join(", ") || "none"}`,
     `Skipped process steps (never generated): ${result.coverage.skipped_process_steps.join(", ") || "none"}`,
   ];
+  if ((result.unresolved_hard_check_ids ?? []).length) {
+    lines.push(
+      "",
+      "unresolved = the deterministic IK search was exhausted for that pose.",
+      "It is not a proof that no solution exists, so the aggregate is UNKNOWN.",
+    );
+  }
   if (result.diagnostic.reasons.length) {
     lines.push("", "Diagnostic reasons:");
     for (const reason of result.diagnostic.reasons) lines.push(`  - ${reason}`);
@@ -675,31 +864,48 @@ function showResult(result) {
 }
 
 function showScoutResult(result) {
+  const describe = base =>
+    `x=${(base.x_m * 1000).toFixed(0)} y=${(base.y_m * 1000).toFixed(0)} ` +
+    `z=${(base.z_m * 1000).toFixed(0)} yaw=${base.yaw_deg.toFixed(1)}`;
+  const strict = result.ranking_strict ?? result.ranking ?? [];
+  const diagnostic = result.ranking_diagnostic ?? [];
   const lines = [
     `Bounded scout ${result.cancelled ? "cancelled" : "complete"} · ${result.candidates.length} candidate(s) evaluated in ${Number(result.elapsed_seconds).toFixed(2)} s`,
     result.interpretation,
     "",
-    "rank  worst normalized sigma_min   UR20 base (mm, deg)",
+    "Gates applied to every ranked candidate:",
   ];
-  result.ranking.forEach((row, index) => {
-    const base = row.ur_base;
-    lines.push(`${String(index + 1).padStart(4)}  ${Number(row.worst_normalized_min_singular_value).toExponential(4)}        ` +
-      `x=${(base.x_m * 1000).toFixed(0)} y=${(base.y_m * 1000).toFixed(0)} z=${(base.z_m * 1000).toFixed(0)} yaw=${base.yaw_deg.toFixed(1)}`);
+  for (const gate of result.gates ?? []) lines.push(`  - ${gate}`);
+  lines.push("", `Strict ranking (full collision contract) — ${strict.length} candidate(s)`);
+  lines.push("rank  worst normalized sigma_min   UR20 base (mm, deg)");
+  strict.forEach((row, index) => {
+    lines.push(`${String(index + 1).padStart(4)}  ${Number(row.worst_normalized_min_singular_value).toExponential(4)}        ${describe(row.ur_base)}`);
   });
+  if (!strict.length) lines.push("  (none)");
+  if (diagnostic.length) {
+    lines.push("", `Diagnostic ranking (weakened contract — NOT comparable to the strict list) — ${diagnostic.length}`);
+    diagnostic.forEach((row, index) => {
+      lines.push(`${String(index + 1).padStart(4)}  ${Number(row.worst_normalized_min_singular_value).toExponential(4)}        ${describe(row.ur_base)}` +
+        ` · ${row.diagnostic_reasons.join("; ")}`);
+    });
+  }
   const skipped = result.candidates.filter(row => row.status !== "feasible");
   if (skipped.length) {
     lines.push("", "Not ranked (no metric is reported for these):");
     for (const row of skipped) {
-      const base = row.ur_base;
-      lines.push(`  ${row.status}: x=${(base.x_m * 1000).toFixed(0)} y=${(base.y_m * 1000).toFixed(0)} z=${(base.z_m * 1000).toFixed(0)} yaw=${base.yaw_deg.toFixed(1)}` +
+      lines.push(`  ${row.status}: ${describe(row.ur_base)}` +
+        (row.installation && !row.installation.valid
+          ? ` · installation INVALID (${row.installation.issues.map(i => i.code).join(", ")})` : "") +
         (row.failed_check ? ` · ${row.failed_check.check_id} ${row.failed_check.status}` : "") +
+        ((row.unresolved_checks ?? []).length ? ` · ${row.unresolved_checks.length} unresolved` : "") +
         (row.message ? ` · ${row.message}` : ""));
     }
   }
-  setBox(resultBox, result.ranking.length ? "diagnostic" : "unknown", lines.join("\n"));
+  setBox(resultBox, strict.length ? "success" : (diagnostic.length ? "diagnostic" : "unknown"), lines.join("\n"));
   el("resultCheck").replaceChildren();
   el("resultSample").replaceChildren();
   el("showPose").disabled = true;
+  el("applyScoutBest").disabled = !(strict.length || diagnostic.length);
 }
 
 function populateResultChecks(result) {
@@ -736,7 +942,7 @@ function showSample() {
   const sample = entry?.samples?.[Number(el("resultSample").value)];
   if (!entry || !sample) { setBox(sampleBox, "unknown", "—"); el("showPose").disabled = true; return; }
   const lines = [
-    `check ${entry.check_id} [${entry.criticality.toUpperCase()}] status=${entry.status}`,
+    `check ${entry.check_id} [${entry.criticality.toUpperCase()}] status=${entry.status} outcome=${entry.outcome ?? "?"}`,
     `scenario=${entry.scenario_id} · collision pairs=${entry.collision_pair_count}` +
       ` · floor=${entry.include_floor ? "on" : "OFF"} · self=${entry.include_self_collision ? "on" : "OFF"}`,
     entry.excluded_targets_applied.length ? `excluded targets applied: ${entry.excluded_targets_applied.join(", ")}` : "excluded targets applied: none",
@@ -1042,8 +1248,13 @@ el("validateRecipe").addEventListener("click", async () => {
 
 el("previewRecipe").addEventListener("click", async () => {
   try {
-    const result = await postJson("/api/study/preview", request({}));
-    jobLine.textContent = `${result.previewed_checks.length}개 check의 marker/segment를 표시했습니다.` +
+    const result = await postJson("/api/study/preview", request({frame_cell: true}));
+    jobLine.textContent =
+      `${result.previewed_checks.length}개 check의 marker/segment를 표시했습니다` +
+      ` · scene ${result.scene_synced ? "recipe case로 갱신" : "미갱신"}` +
+      ` · payload ${result.payload_display}` +
+      (result.payload_display === "schematic_authored_start"
+        ? " (도식 표시, 계산된 자세 아님)" : "") +
       (result.viewer_available ? "" : " (viewer 없음)");
   } catch (error) {
     jobLine.textContent = `미리보기 실패: ${error.message}`;
@@ -1082,8 +1293,49 @@ el("showPose").addEventListener("click", async () => {
   const entry = latestResult?.checks?.[Number(el("resultCheck").value)];
   const sample = entry?.samples?.[Number(el("resultSample").value)];
   if (!sample || !Array.isArray(sample.q)) return;
-  try { await postJson("/api/study/show", {q: sample.q}); jobLine.textContent = "성공한 관절 자세를 3D에 표시했습니다."; }
-  catch (error) { jobLine.textContent = `자세 표시 실패: ${error.message}`; }
+  // Sending the recipe and the check id places the payload with the actually
+  // solved TCP pose instead of leaving a schematic box behind.  That is only
+  // honest while the recipe still matches the run: a since-edited recipe has
+  // a different effective case, so its scene and payload would not belong to
+  // this q.  In that case only the joint configuration is shown.
+  const stale = staleNote.innerHTML !== "";
+  const body = stale
+    ? {q: sample.q}
+    : request({q: sample.q, check_id: entry.check_id});
+  try {
+    const result = await postJson("/api/study/show", body);
+    jobLine.textContent = `성공한 관절 자세를 3D에 표시했습니다 · payload ${result.payload_display} (${result.payload_boxes} box)` +
+      (stale ? " · recipe가 편집되어 payload/scene은 표시하지 않았습니다" : "");
+  } catch (error) {
+    jobLine.textContent = `자세 표시 실패: ${error.message}`;
+  }
+});
+
+el("applyCase").addEventListener("click", () => { void applyCase(); });
+el("revertCase").addEventListener("click", () => { syncCaseControls(); });
+
+el("frameCell").addEventListener("click", async () => {
+  try {
+    const result = await postJson("/api/study/frame", {parameters: recipe.parameters});
+    jobLine.textContent = result.framed
+      ? `카메라를 cell 중심 (${result.camera.center_x_m.toFixed(2)}, ${result.camera.center_y_m.toFixed(2)}, ${result.camera.center_z_m.toFixed(2)}) m 로 맞췄습니다.`
+      : `카메라를 맞추지 못함: ${result.message}`;
+  } catch (error) {
+    jobLine.textContent = `Frame cell 실패: ${error.message}`;
+  }
+});
+
+el("applyScoutBest").addEventListener("click", () => {
+  const best = latestResult?.ranking_strict?.[0] ?? latestResult?.ranking_diagnostic?.[0];
+  if (!best) { jobLine.textContent = "적용할 scout 후보가 없습니다."; return; }
+  for (const [key, source] of [["ur_x", "x_m"], ["ur_y", "y_m"], ["ur_z", "z_m"], ["ur_yaw", "yaw_deg"]]) {
+    const control = caseControls.get(key);
+    if (!control) continue;
+    const scale = Number(control.definition.ui_scale ?? 1);
+    control.input.value = String(best.ur_base[source] * scale);
+  }
+  markCaseEdited();
+  jobLine.textContent = "scout 후보 base를 Case 입력에 넣었습니다. Apply case를 눌러 적용하세요.";
 });
 
 el("resultCheck").addEventListener("change", populateResultSamples);
@@ -1163,6 +1415,7 @@ function applyLoadedRecipe(result) {
   if (!result.fingerprint_match) {
     recipe = clone(result.recipe);
     renderAll();
+    showCaseStatus("failed", "fingerprint 불일치: case를 적용하지 않았습니다.");
     setBox(resultBox, "failed",
       `scene/model fingerprint가 다릅니다. recipe를 편집용으로만 불러왔고 자동 적용하지 않았습니다.\n` +
       `${result.message}\n현재 scene: ${result.expected_scene_fingerprint}\nrecipe: ${result.recipe.scene_fingerprint || "(없음)"}`);
@@ -1174,8 +1427,18 @@ function applyLoadedRecipe(result) {
     setBox(resultBox, "failed", `recipe를 적용하지 못했습니다: ${result.resolve_error ?? result.message}`);
     return;
   }
-  setBox(resultBox, "success", `${result.recipe.recipe_id}를 불러왔습니다.\nrecipe_hash: ${result.recipe_hash}`);
-  void refreshResolved().catch(() => {});
+  // The loaded recipe's own case is now the effective case; templates,
+  // frames and targets must be regenerated for it.
+  void refreshCatalogForRecipe().then(() => {
+    const p = recipe.parameters;
+    setBox(resultBox, "success", [
+      `${result.recipe.recipe_id}를 불러왔습니다.`,
+      `effective case: UR20 x=${(p.ur_x * 1000).toFixed(0)} y=${(p.ur_y * 1000).toFixed(0)} z=${(p.ur_z * 1000).toFixed(0)} mm yaw=${p.ur_yaw} deg`,
+      `SKU ${p.sku} · corner ${p.corner} · lift ${(p.lift * 1000).toFixed(0)} mm · tote ${(p.tote * 1000).toFixed(0)} mm · mode ${p.mode}`,
+      `approach ${(recipe.approach_distance_m * 1000).toFixed(0)} mm`,
+      `recipe_hash: ${result.recipe_hash}`,
+    ].join("\n"));
+  });
 }
 
 function renderSavedRecipes(entries) {
@@ -1195,6 +1458,36 @@ function renderSavedRecipes(entries) {
   if ([...select.options].some(option => option.value === previous)) select.value = previous;
 }
 
+function applyCatalog(result) {
+  catalog = result;
+  const roles = [...new Set(result.collision_targets.map(item => item.role))].sort();
+  const roleSelect = el("targetRole");
+  const previousRole = roleSelect.value;
+  roleSelect.replaceChildren();
+  const all = document.createElement("option");
+  all.value = "";
+  all.textContent = "(all roles)";
+  roleSelect.append(all);
+  for (const role of roles) {
+    const option = document.createElement("option");
+    option.value = role;
+    option.textContent = role;
+    roleSelect.append(option);
+  }
+  if ([...roleSelect.options].some(option => option.value === previousRole)) {
+    roleSelect.value = previousRole;
+  }
+  const names = el("contactNames");
+  names.replaceChildren();
+  for (const name of result.contact_names) {
+    const option = document.createElement("option");
+    option.value = name;
+    names.append(option);
+  }
+  el("fingerprintNote").textContent =
+    `scene fingerprint ${result.scene_fingerprint.slice(0, 12)}… · rotation ${result.units.rotation_convention}`;
+}
+
 function renderAll() {
   if (!recipe.scenarios.length) recipe.scenarios = [clone(catalog.baseline_recipe.scenarios[0])];
   selectedCheckId = recipe.checks.some(item => item.check_id === selectedCheckId)
@@ -1209,6 +1502,7 @@ function renderAll() {
   renderCheckList();
   renderScenarioControls();
   syncCheckDetail();
+  if (caseControls.size) syncCaseControls();
 }
 
 async function initialize() {
@@ -1224,25 +1518,8 @@ async function initialize() {
       el("recipeProfile").append(option);
     }
     el("recipeProfile").value = result.default_profile;
-    const roles = [...new Set(result.collision_targets.map(item => item.role))].sort();
-    el("targetRole").replaceChildren();
-    const all = document.createElement("option");
-    all.value = "";
-    all.textContent = "(all roles)";
-    el("targetRole").append(all);
-    for (const role of roles) {
-      const option = document.createElement("option");
-      option.value = role;
-      option.textContent = role;
-      el("targetRole").append(option);
-    }
-    const names = el("contactNames");
-    names.replaceChildren();
-    for (const name of result.contact_names) {
-      const option = document.createElement("option");
-      option.value = name;
-      names.append(option);
-    }
+    applyCatalog(result);
+    buildCaseControls();
     const base = result.parameters;
     el("scoutXMin").value = String(base.ur_x * 1000 - 200);
     el("scoutXMax").value = String(base.ur_x * 1000 + 200);
@@ -1254,10 +1531,10 @@ async function initialize() {
     el("scoutYawMax").value = String(base.ur_yaw);
     renderSavedRecipes(result.saved_recipes);
     renderAll();
-    el("fingerprintNote").textContent = `scene fingerprint ${result.scene_fingerprint.slice(0, 12)}… · rotation ${result.units.rotation_convention}`;
     setBox(loadStatus, "success", [
       `templates ${result.templates.length} · collision targets ${result.collision_targets.length} · frames ${result.reference_frames.length}`,
       `baseline checks ${result.baseline_recipe.checks.length} (zero offset, references the generated workflow)`,
+      `installation: ${result.installation.valid ? "valid" : "INVALID"} · SR workspace: ${result.sr_workspace.checked ? (result.sr_workspace.feasible ? "feasible" : "infeasible") : "not checked"} (reported only)`,
       `UI length mm / angle deg · stored length m · rotation ${result.units.rotation_convention}`,
       result.units.template_relative_order,
     ].join("\n"));

@@ -17,11 +17,32 @@ from decanting_workspace.study_store import (
 )
 
 
+# A recipe now names its own effective case, so every fixture supplies the
+# full 15-key parameter set the evaluator actually consumes.
+CASE = {
+    "ur_x": -1.3,
+    "ur_y": -7.35,
+    "ur_z": 0.85,
+    "ur_yaw": 90.0,
+    "sr_x": -0.3,
+    "sr_y": -7.073643684,
+    "sr_z": 0.665,
+    "sr_yaw": -90.0,
+    "sku": "123591",
+    "lift": 0.2,
+    "tote": 0.7,
+    "stroke": 0.45,
+    "clearance": None,
+    "corner": "southwest",
+    "mode": "sequential",
+}
+
+
 def _recipe(recipe_id: str = "r1") -> StudyRecipe:
     return StudyRecipe(
         recipe_id=recipe_id,
         label=f"recipe {recipe_id}",
-        parameters={"ur_x": -1.3, "corner": "southwest"},
+        parameters=dict(CASE),
         checks=(
             StudyCheck(
                 check_id="c1",

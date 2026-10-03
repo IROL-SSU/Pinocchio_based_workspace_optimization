@@ -141,6 +141,7 @@ def test_page_posts_only_the_documented_study_endpoints(page):
         "/api/study/validate",
         "/api/study/preview",
         "/api/study/preview/clear",
+        "/api/study/frame",
         "/api/study/recipe/save",
         "/api/study/recipe/load",
         "/api/study/recipe/import",
@@ -216,3 +217,78 @@ def test_page_polls_rather_than_blocking_on_a_long_run(page):
     assert "setTimeout(pollJob, POLL_MS)" in page
     assert '"/api/study/job"' in page
     assert "cancelJob" in page
+
+
+# ------------------------------------------- the recipe-owned effective case
+
+
+def test_page_exposes_the_effective_case_panel(page):
+    for identifier in (
+        "caseControls",
+        "caseApproach",
+        "applyCase",
+        "revertCase",
+        "caseStatus",
+        "frameCell",
+        "applyScoutBest",
+    ):
+        assert f'id="{identifier}"' in page, identifier
+    # The panel has to be built from the server's own bounds, never from
+    # numbers hard-coded in the browser.
+    assert "catalog.parameter_schema" in page
+    assert "catalog has no parameter_schema" in page
+
+
+def test_page_never_sends_a_parameter_override_beside_a_recipe(page):
+    # The effective case is hashed into recipe_hash, so a per-request override
+    # would detach the displayed result from the recipe that names it.
+    assert "return Object.assign({recipe: recipePayload()}, extra || {});" in page
+    assert "parameters: catalog.parameters" not in page
+
+
+def test_page_reports_the_effective_case_and_installation_with_every_result(page):
+    assert "Effective case: UR20" in page
+    assert "Installation (independent of collision scenarios)" in page
+    # The SR cutting workspace is context, not part of the UR20 verdict.
+    assert "not part of this certification" in page
+
+
+def test_page_distinguishes_unresolved_ik_from_a_collision(page):
+    assert "unresolved (ik_not_found)" in page
+    assert "It is not a proof that no solution exists" in page
+    assert "collision_hard_check_ids" in page
+    assert "unresolved_hard_check_ids" in page
+
+
+def test_page_separates_the_strict_and_diagnostic_scout_rankings(page):
+    assert "ranking_strict" in page
+    assert "ranking_diagnostic" in page
+    assert "NOT comparable to the strict list" in page
+
+
+def test_page_labels_the_exclusion_list_as_exclusion_and_the_toggles_as_include(
+    page,
+):
+    # The two controls run in opposite directions, which is exactly the kind of
+    # thing a user gets wrong once and never notices.
+    assert "INCLUDE robot self collision" in page
+    assert "INCLUDE floor collision" in page
+    assert "<strong>EXCLUDED</strong>" in page
+
+
+def test_page_marks_a_preview_payload_as_schematic_rather_than_solved(page):
+    assert "payload_display" in page
+    assert "계산된 자세 아님" in page
+
+
+def test_page_restores_the_previous_case_when_the_server_refuses_one(page):
+    assert "recipe.parameters = previousParameters;" in page
+    assert "recipe.approach_distance_m = previousApproach;" in page
+
+
+def test_page_will_not_place_a_payload_for_a_since_edited_recipe(page):
+    # An edited recipe names a different effective case, so its scene and
+    # payload do not belong to the stored joint configuration.
+    assert "const stale = staleNote.innerHTML !== \"\";" in page
+    assert "? {q: sample.q}" in page
+    assert "payload/scene은 표시하지 않았습니다" in page

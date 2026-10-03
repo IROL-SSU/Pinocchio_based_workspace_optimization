@@ -40,11 +40,20 @@ from .evaluation import (
     collision_phase_for_check,
     evaluate_linear_check,
 )
+from .kinematics import frame_pose
 from .models import BasePose, BoxPrimitive, MeshObstacle, SceneSpec, SceneState
+from .placement import PlacementReport, validate_base_placement
 from .precompute import CaseKey, scene_spec_fingerprint
 from .robots import RobotBundle, configure_sr_j3_stroke
-from .scene import CORNER_SIGNS, SceneSnapshot, materialize_scene
+from .scara_workspace import ScaraTaskWorkspaceReport, evaluate_sr_cutting_workspace
+from .scene import (
+    CORNER_SIGNS,
+    SceneSnapshot,
+    materialize_scene,
+    tote_long_axis_offset_range_m,
+)
 from .study_recipe import (
+    CASE_PARAMETER_KEYS,
     STUDY_SCHEMA_VERSION,
     CollisionScenario,
     Pose6D,
@@ -53,7 +62,9 @@ from .study_recipe import (
     StudyRecipe,
     TemplateRef,
     WORLD_FRAME,
+    case_parameters_equal,
     default_collision_scenario,
+    validate_case_parameters,
 )
 from .study_store import StudyRecipeStore
 from .transforms import inverse_transform, quaternion_matrix
@@ -73,6 +84,27 @@ STUDY_API_VERSION = 1
 PROCESS_OBJECT_ROLES = frozenset({"box", "box_sample_alternative", "tote"})
 MAX_SCOUT_CANDIDATES = 64
 MAX_JOB_HISTORY = 8
+
+# An exhausted deterministic IK search is not a proof that no solution
+# exists, so it is reported as unresolved rather than infeasible.  Only an
+# actual collision witness at an attempted pose or along an attempted local
+# segment is evidence of infeasibility, and only for that pose or segment.
+COLLISION_WITNESS_STATUSES = frozenset(
+    {"solution_in_collision", "joint_segment_collision"}
+)
+UNRESOLVED_STATUSES = frozenset({"ik_not_found"})
+
+
+def check_outcome(status: str) -> str:
+    """Map one raw check status onto success / collision / unresolved."""
+
+    if status == "success":
+        return "success"
+    if status in COLLISION_WITNESS_STATUSES:
+        return "collision"
+    if status in UNRESOLVED_STATUSES:
+        return "unresolved"
+    return "unresolved"
 
 _MARKER_COLOR_HARD = 0x3478C5
 _MARKER_COLOR_SOFT = 0xD2A33B
@@ -119,6 +151,7 @@ class CheckTemplate:
     allowed_contacts: tuple[tuple[str, str], ...]
     start: Pose6D | None
     end: Pose6D | None
+    contact_provenance: tuple[str, ...] = ()
 
     def payload(self) -> dict[str, object]:
         return {
@@ -131,6 +164,7 @@ class CheckTemplate:
             "contact_object_name": self.contact_object_name,
             "object_names": list(self.object_names),
             "allowed_contacts": [list(pair) for pair in self.allowed_contacts],
+            "contact_provenance": list(self.contact_provenance),
             "supplies_pose": self.reference.supplies_pose,
             "start": None if self.start is None else self.start.payload(),
             "end": None if self.end is None else self.end.payload(),
@@ -150,6 +184,10 @@ class ResolvedCheck:
     world_end: np.ndarray
     excluded_applied: tuple[str, ...]
     missing_excluded: tuple[str, ...]
+    # Snapshot objects the phase step removes because this check carries or
+    # has already moved them.  The display must hide exactly these, or a
+    # carried carton appears both at its pallet slot and on the TCP.
+    suppressed_snapshot_objects: tuple[str, ...] = ()
 
 
 # --------------------------------------------------------------------------
@@ -159,12 +197,57 @@ class ResolvedCheck:
 
 @dataclass(frozen=True)
 class WorkflowContext:
-    """One materialized scene plus its generated task sequence."""
+    """One materialized scene plus its generated task sequence.
+
+    ``placement`` is the original installation gate from
+    :func:`validate_base_placement`.  It is computed from scene geometry
+    alone, so a collision scenario that excludes targets cannot weaken it.
+    """
 
     key: CaseKey
     state: SceneState
     snapshot: SceneSnapshot
     steps: tuple[TaskStepSpec, ...]
+    approach_distance_m: float
+    placement: PlacementReport
+    sr_workspace: ScaraTaskWorkspaceReport | None
+
+    def installation_payload(self) -> dict[str, object]:
+        return {
+            "valid": bool(self.placement.valid),
+            "clearance_m": (
+                0.0 if self.key.clearance_m is None else float(self.key.clearance_m)
+            ),
+            "issues": [
+                {
+                    "code": issue.code,
+                    "objects": list(issue.objects),
+                    "message": issue.message,
+                }
+                for issue in self.placement.issues
+            ],
+            "source": (
+                "validate_base_placement, independent of collision scenarios"
+            ),
+        }
+
+    def sr_workspace_payload(self) -> dict[str, object]:
+        if self.sr_workspace is None:
+            return {"checked": False, "reason": "SR workspace specification missing"}
+        report = self.sr_workspace
+        return {
+            "checked": True,
+            "feasible": bool(report.feasible),
+            "footprint_ok": bool(report.footprint_ok),
+            "planar_reach_ok": bool(report.planar_reach_ok),
+            "vertical_ok": bool(report.vertical_ok),
+            "sku": report.sku,
+            "j3_stroke_m": float(report.j3_stroke_m),
+            "note": (
+                "conservative SR cutting-workspace geometry; reported for "
+                "context and never folded into the UR20 study certification"
+            ),
+        }
 
     def step(self, index: int) -> TaskStepSpec:
         for step in self.steps:
@@ -259,7 +342,13 @@ class StudyEvaluationBackend:
         self.viewer = viewer
         self.profiles = dict(profiles)
         self.default_profile = default_profile
-        self.compute_lock = compute_lock or threading.Lock()
+        self.compute_lock = compute_lock or threading.RLock()
+        if not _lock_is_reentrant(self.compute_lock):
+            raise ValueError(
+                "compute_lock must be reentrant (threading.RLock); the study "
+                "re-enters it when a serialized route calls a backend method "
+                "that also regenerates the workflow"
+            )
         self.store = store or StudyRecipeStore()
         self.approach_distance_m = _positive(approach_distance_m, "approach_distance_m")
         self.keepout_margin_m = _nonnegative(keepout_margin_m, "keepout_margin_m")
@@ -279,9 +368,19 @@ class StudyEvaluationBackend:
         """Return templates, collision targets, frames and a baseline recipe."""
 
         parameters = None
-        if isinstance(request, Mapping) and request.get("parameters") is not None:
-            parameters = _required_mapping(request.get("parameters"), "parameters")
-        context = self._workflow_context(parameters)
+        approach = None
+        if isinstance(request, Mapping):
+            if request.get("parameters") is not None:
+                parameters = validate_case_parameters(
+                    request.get("parameters"), "parameters"
+                )
+            if request.get("approach_distance_m") is not None:
+                approach = _positive(
+                    request.get("approach_distance_m"), "approach_distance_m"
+                )
+        context = self._workflow_context(
+            parameters, approach_distance_m=approach
+        )
         templates = self._templates(context)
         targets = self._collision_targets(context)
         baseline = self.baseline_recipe(context, templates)
@@ -304,7 +403,11 @@ class StudyEvaluationBackend:
                 for profile_id, options in self.profiles.items()
             ],
             "default_profile": self.default_profile,
-            "approach_distance_m": self.approach_distance_m,
+            "approach_distance_m": context.approach_distance_m,
+            "startup_approach_distance_m": self.approach_distance_m,
+            "installation": context.installation_payload(),
+            "sr_workspace": context.sr_workspace_payload(),
+            "parameter_schema": _case_parameter_schema(self.spec, context.key),
             "templates": [template.payload() for template in templates],
             "collision_targets": [target.payload() for target in targets],
             "reference_frames": self._reference_frames(context),
@@ -373,7 +476,7 @@ class StudyEvaluationBackend:
             parameters=_parameter_payload(resolved_context.key),
             scene_fingerprint=self.scene_fingerprint,
             profile=self.default_profile,
-            approach_distance_m=self.approach_distance_m,
+            approach_distance_m=resolved_context.approach_distance_m,
             checks=tuple(checks),
             scenarios=(default_collision_scenario(),),
         )
@@ -394,6 +497,9 @@ class StudyEvaluationBackend:
             "fingerprint_match": self._fingerprint_match(recipe),
             "fingerprint_override": bool(allow_mismatch),
             "expected_scene_fingerprint": self.scene_fingerprint,
+            "effective": self._effective_payload(recipe, context),
+            "installation": context.installation_payload(),
+            "sr_workspace": context.sr_workspace_payload(),
             "diagnostic": self._diagnostic_report(recipe, resolved, coverage),
             "coverage": coverage,
             "resolved_checks": [
@@ -402,7 +508,14 @@ class StudyEvaluationBackend:
         }
 
     def preview(self, request: Mapping[str, object]) -> Mapping[str, object]:
-        """Draw authored pose markers, segments and target highlights."""
+        """Sync the shared scene to the recipe's case, then draw its overlays.
+
+        The visible environment is re-materialized for the recipe's own base,
+        lift, tote offset and corner, so the 3-D view matches the case that
+        would actually be evaluated.  Payload boxes drawn here are explicitly
+        schematic: they sit at the authored start pose and have no solved
+        joint configuration behind them.
+        """
 
         recipe, context, _ = self._recipe_from_request(request)
         resolved = self._resolve_checks(recipe, context)
@@ -443,23 +556,104 @@ class StudyEvaluationBackend:
                     )
                 )
 
+        payload_objects: list[
+            tuple[str, tuple[float, ...], np.ndarray]
+        ] = []
+        payload_check = shown[0] if len(shown) == 1 else None
+        if payload_check is not None:
+            for state in payload_check.pose_check.object_states:
+                if state.tcp_T_object is not None and (
+                    state.attached_to_tcp or state.follows_tcp
+                ):
+                    transform = payload_check.world_start @ state.tcp_T_object.matrix
+                else:
+                    transform = state.world_T_object.matrix
+                payload_objects.append(
+                    (state.name, tuple(state.size_m), np.asarray(transform))
+                )
+
+        # Only a single-check preview can show one phase faithfully: the
+        # objects a check carries are hidden at their nominal slot and redrawn
+        # on the authored TCP.  Several checks at once have no single phase, so
+        # the nominal scene is shown unchanged and no payload is drawn, rather
+        # than silently displaying one check's state for all of them.
+        hidden = (
+            payload_check.suppressed_snapshot_objects
+            if payload_check is not None
+            else ()
+        )
         boxes, meshes, missing = self._highlight_geometry(context, highlight or ())
         marker_count = 0
         highlight_count = 0
+        payload_count = 0
+        camera = None
+        synced = False
         if self.viewer is not None:
             with self.compute_lock:
+                self.viewer.update_scene(
+                    self.spec,
+                    context.snapshot,
+                    hide_object_names=hidden,
+                )
+                synced = True
                 marker_count = self.viewer.render_study_markers(markers, segments)
                 highlight_count = self.viewer.render_study_target_highlight(
                     boxes, meshes
                 )
+                payload_count = self.viewer.render_study_payload(
+                    payload_objects, evaluated=False
+                )
+                if _boolean(request.get("frame_cell", False), "frame_cell"):
+                    camera = self.viewer.frame_scene(self.spec, context.snapshot)
         return {
             "schema_version": STUDY_API_VERSION,
             "recipe_hash": recipe.recipe_hash,
+            "effective": self._effective_payload(recipe, context),
             "marker_nodes": marker_count,
             "highlighted": highlight_count,
             "missing_highlight_targets": list(missing),
             "previewed_checks": [item.recipe_check.check_id for item in shown],
+            "scene_synced": synced,
+            "payload_boxes": payload_count,
+            "hidden_snapshot_objects": list(hidden),
+            "payload_display": (
+                "schematic_authored_start"
+                if payload_objects
+                else "none"
+            ),
+            "payload_note": (
+                "schematic marker overlay at the authored start pose; it is "
+                "not an evaluated joint solution"
+                if payload_objects
+                else "process objects are at their nominal scene positions; "
+                "preview a single check to see that check's own phase"
+            ),
+            "camera": camera,
             "viewer_available": self.viewer is not None,
+        }
+
+    def frame_cell(self, request: Mapping[str, object] | None = None) -> Mapping[str, object]:
+        """Re-centre the shared camera on the cell without changing the scene."""
+
+        parameters = None
+        if isinstance(request, Mapping) and request.get("parameters") is not None:
+            parameters = validate_case_parameters(
+                request.get("parameters"), "parameters"
+            )
+        if self.viewer is None:
+            return {
+                "schema_version": STUDY_API_VERSION,
+                "framed": False,
+                "message": "no viewer is attached to this backend",
+            }
+        context = self._workflow_context(parameters)
+        with self.compute_lock:
+            camera = self.viewer.frame_scene(self.spec, context.snapshot)
+        return {
+            "schema_version": STUDY_API_VERSION,
+            "framed": True,
+            "camera": camera,
+            "parameters": _parameter_payload(context.key),
         }
 
     def clear_preview(self, request: Mapping[str, object] | None = None) -> Mapping[str, object]:
@@ -637,7 +831,13 @@ class StudyEvaluationBackend:
         return {"schema_version": STUDY_API_VERSION, "job": snapshot}
 
     def show_configuration(self, request: Mapping[str, object]) -> Mapping[str, object]:
-        """Display one stored successful configuration in the shared viewer."""
+        """Display one solved configuration, with its payload at the solved TCP.
+
+        Supplying ``recipe`` and ``check_id`` places the check's payload using
+        the actual solved ``suction_tcp`` pose of ``q``.  That replaces any
+        schematic preview box, so the view never shows a stale authored pose
+        alongside an evaluated one.
+        """
 
         values = request.get("q")
         if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
@@ -647,15 +847,68 @@ class StudyEvaluationBackend:
             raise RecipeError(
                 f"q must contain {int(self.ur_bundle.model.nq)} values"
             )
+        check_id = request.get("check_id")
+        if check_id is not None and not isinstance(check_id, str):
+            raise RecipeError("check_id must be a string")
+        resolved_check = None
+        context: WorkflowContext | None = None
+        if request.get("recipe") is not None and check_id:
+            recipe, context, _ = self._recipe_from_request(request)
+            matches = [
+                item
+                for item in self._resolve_checks(recipe, context)
+                if item.recipe_check.check_id == check_id
+            ]
+            if not matches:
+                raise RecipeError(f"unknown check id: {check_id!r}")
+            resolved_check = matches[0]
         if self.viewer is None:
             return {
                 "schema_version": STUDY_API_VERSION,
                 "displayed": False,
                 "message": "no viewer is attached to this backend",
             }
+        payload_count = 0
         with self.compute_lock:
+            if resolved_check is not None and context is not None:
+                # Hide the objects this phase carries before redrawing them on
+                # the solved TCP, so no nominal copy is left behind.
+                self.viewer.update_scene(
+                    self.spec,
+                    context.snapshot,
+                    hide_object_names=resolved_check.suppressed_snapshot_objects,
+                )
             self._display(configuration)
-        return {"schema_version": STUDY_API_VERSION, "displayed": True}
+            if resolved_check is not None:
+                world_T_tcp = frame_pose(
+                    self.ur_bundle, configuration, "suction_tcp"
+                )
+                objects: list[tuple[str, tuple[float, ...], np.ndarray]] = []
+                for state in resolved_check.pose_check.object_states:
+                    if state.tcp_T_object is not None and (
+                        state.attached_to_tcp or state.follows_tcp
+                    ):
+                        transform = world_T_tcp @ state.tcp_T_object.matrix
+                    else:
+                        transform = state.world_T_object.matrix
+                    objects.append(
+                        (state.name, tuple(state.size_m), np.asarray(transform))
+                    )
+                payload_count = self.viewer.render_study_payload(
+                    objects, evaluated=True
+                )
+            else:
+                # Clear any schematic box so it cannot be read as evaluated.
+                self.viewer.render_study_payload((), evaluated=True)
+        return {
+            "schema_version": STUDY_API_VERSION,
+            "displayed": True,
+            "payload_boxes": payload_count,
+            "payload_display": (
+                "evaluated_solved_pose" if resolved_check is not None else "none"
+            ),
+            "check_id": check_id,
+        }
 
     # -- bounded scout ---------------------------------------------------
 
@@ -680,7 +933,15 @@ class StudyEvaluationBackend:
         job = self._create_job(kind="scout", recipe=recipe, total=len(candidates))
         thread = self.thread_factory(
             target=self._run_scout_job,
-            args=(job, recipe, candidates, options, settings, bool(allow_mismatch)),
+            args=(
+                job,
+                recipe,
+                candidates,
+                options,
+                settings,
+                bool(allow_mismatch),
+                context,
+            ),
             name=f"study-scout-{job.job_id}",
             daemon=True,
         )
@@ -701,47 +962,79 @@ class StudyEvaluationBackend:
         self,
         parameters: Mapping[str, object] | None,
         *,
+        approach_distance_m: float | None = None,
         ur_base: BasePose | None = None,
     ) -> WorkflowContext:
-        key = (
-            self.initial_key
-            if parameters is None
-            else _case_key_from_parameters(self.spec, parameters)
+        """Regenerate the scene and task sequence for one effective case.
+
+        This mutates the shared SR bundle J3 limit and runs Pinocchio forward
+        kinematics, so it always takes the shared compute lock itself.  The
+        lock is reentrant, so a serialized route that already holds it can
+        call this without deadlocking.
+        """
+
+        approach = (
+            self.approach_distance_m
+            if approach_distance_m is None
+            else _positive(approach_distance_m, "approach_distance_m")
         )
-        if ur_base is not None:
-            key = replace(key, ur_base=ur_base)
-        state = SceneState(
-            lift_height_m=key.lift_height_m,
-            sku=key.sku,
-            corner_samples=(key.corner,),
-            tote_present=self.tote_present,
-            tote_long_axis_offset_m=key.tote_offset_m,
-            sr_j3_stroke_m=key.sr_j3_stroke_m,
-            clearance_m=key.clearance_m,
-        )
-        snapshot = materialize_scene(
-            self.spec, state, ur_base=key.ur_base, sr_base=key.sr_base
-        )
-        scenario = ProcessScenario(state, key.corner, key.coordination_mode)
-        keepout = None
-        if key.coordination_mode is CoordinationMode.SIMULTANEOUS:
-            configure_sr_j3_stroke(self.sr_bundle, key.sr_j3_stroke_m)
-            keepout = sr_concurrent_exclusion_box(
+        with self.compute_lock:
+            key = (
+                self.initial_key
+                if parameters is None
+                else _case_key_from_parameters(self.spec, parameters)
+            )
+            if ur_base is not None:
+                key = replace(key, ur_base=ur_base)
+            state = SceneState(
+                lift_height_m=key.lift_height_m,
+                sku=key.sku,
+                corner_samples=(key.corner,),
+                tote_present=self.tote_present,
+                tote_long_axis_offset_m=key.tote_offset_m,
+                sr_j3_stroke_m=key.sr_j3_stroke_m,
+                clearance_m=key.clearance_m,
+            )
+            snapshot = materialize_scene(
+                self.spec, state, ur_base=key.ur_base, sr_base=key.sr_base
+            )
+            # The original installation gate, evaluated from scene geometry
+            # before any collision scenario is applied.
+            placement = validate_base_placement(
                 self.spec,
                 snapshot,
-                self.sr_bundle,
-                margin_m=self.keepout_margin_m,
+                clearance_m=0.0 if key.clearance_m is None else key.clearance_m,
             )
-        steps = build_ur20_task_sequence(
-            self.spec,
-            snapshot,
-            scenario,
-            self.ur_bundle,
-            sr_keepout=keepout,
-            approach_distance_m=self.approach_distance_m,
-        )
+            try:
+                sr_workspace = evaluate_sr_cutting_workspace(self.spec, snapshot)
+            except ValueError:
+                sr_workspace = None
+            scenario = ProcessScenario(state, key.corner, key.coordination_mode)
+            keepout = None
+            if key.coordination_mode is CoordinationMode.SIMULTANEOUS:
+                configure_sr_j3_stroke(self.sr_bundle, key.sr_j3_stroke_m)
+                keepout = sr_concurrent_exclusion_box(
+                    self.spec,
+                    snapshot,
+                    self.sr_bundle,
+                    margin_m=self.keepout_margin_m,
+                )
+            steps = build_ur20_task_sequence(
+                self.spec,
+                snapshot,
+                scenario,
+                self.ur_bundle,
+                sr_keepout=keepout,
+                approach_distance_m=approach,
+            )
         return WorkflowContext(
-            key=key, state=state, snapshot=snapshot, steps=tuple(steps)
+            key=key,
+            state=state,
+            snapshot=snapshot,
+            steps=tuple(steps),
+            approach_distance_m=approach,
+            placement=placement,
+            sr_workspace=sr_workspace,
         )
 
     def _templates(self, context: WorkflowContext) -> tuple[CheckTemplate, ...]:
@@ -768,15 +1061,15 @@ class StudyEvaluationBackend:
                         ),
                         start=_pose_to_6d(check.start_tcp.matrix),
                         end=_pose_to_6d(check.end_tcp.matrix),
+                        contact_provenance=(
+                            f"step {step.index} check {check.name}",
+                        ),
                     )
                 )
             if step.object_states:
-                union: list[tuple[str, str]] = []
-                for check in step.pose_checks:
-                    for pair in check.allowed_contacts:
-                        canonical = tuple(sorted(pair))
-                        if canonical not in union:
-                            union.append(canonical)
+                inherited, provenance = inherited_payload_contacts(
+                    context.steps, step.object_states
+                )
                 attached = [
                     state.name
                     for state in step.object_states
@@ -798,9 +1091,10 @@ class StudyEvaluationBackend:
                         object_names=tuple(
                             state.name for state in step.object_states
                         ),
-                        allowed_contacts=tuple(union),
+                        allowed_contacts=inherited,
                         start=None,
                         end=None,
+                        contact_provenance=provenance,
                     )
                 )
         return tuple(templates)
@@ -936,6 +1230,15 @@ class StudyEvaluationBackend:
     def _recipe_from_request(
         self, request: Mapping[str, object]
     ) -> tuple[StudyRecipe, WorkflowContext, bool]:
+        """Parse one request and build the context for its effective case.
+
+        The recipe's own ``parameters`` and ``approach_distance_m`` are the
+        effective case, and both are inside ``recipe_hash``.  A request may
+        echo ``parameters`` back, but a value that differs from the recipe is
+        rejected: silently computing one case while reporting the hash of
+        another would make every stored result unattributable.
+        """
+
         raw = request.get("recipe")
         if raw is None:
             raise RecipeError("recipe is required")
@@ -955,13 +1258,40 @@ class StudyEvaluationBackend:
                 f"{self.scene_fingerprint}); review it and resend with "
                 "allow_fingerprint_mismatch=true to continue as a diagnostic"
             )
-        parameters = request.get("parameters")
-        if parameters is None:
-            parameters = recipe.parameters or None
-        if parameters is not None:
-            parameters = _required_mapping(parameters, "parameters")
-        context = self._workflow_context(parameters)
+        override = request.get("parameters")
+        if override is not None:
+            supplied = validate_case_parameters(override, "parameters")
+            if not case_parameters_equal(supplied, recipe.parameters):
+                differing = sorted(
+                    key
+                    for key in CASE_PARAMETER_KEYS
+                    if not case_parameters_equal(
+                        {key: supplied[key]}, {key: recipe.parameters[key]}
+                    )
+                )
+                raise RecipeError(
+                    "request parameters conflict with recipe.parameters for "
+                    f"{differing}; the effective case is part of recipe_hash, "
+                    "so edit the recipe instead of overriding it per request"
+                )
+        context = self._workflow_context(
+            recipe.parameters, approach_distance_m=recipe.approach_distance_m
+        )
         return recipe, context, allow_mismatch
+
+    def _effective_payload(
+        self, recipe: StudyRecipe, context: WorkflowContext
+    ) -> dict[str, object]:
+        """Return exactly what was computed, for display beside the hash."""
+
+        return {
+            "parameters": _parameter_payload(context.key),
+            "approach_distance_m": context.approach_distance_m,
+            "keepout_margin_m": self.keepout_margin_m,
+            "profile": recipe.profile,
+            "tote_present": self.tote_present,
+            "source": "recipe (parameters and approach_distance_m are hashed)",
+        }
 
     def _fingerprint_match(self, recipe: StudyRecipe) -> bool:
         return recipe.scene_fingerprint == self.scene_fingerprint
@@ -978,6 +1308,17 @@ class StudyEvaluationBackend:
         self, recipe: StudyRecipe, context: WorkflowContext
     ) -> tuple[ResolvedCheck, ...]:
         valid_names = self._valid_contact_names(context)
+        target_names = {target.name for target in self._collision_targets(context)}
+        # A misspelled exclusion must be refused, not silently ignored: it
+        # would otherwise read as an applied diagnostic that changed nothing.
+        for scenario in recipe.scenarios:
+            unknown = sorted(set(scenario.excluded_targets) - target_names)
+            if unknown:
+                raise RecipeError(
+                    f"scenario {scenario.scenario_id} excludes collision "
+                    f"target(s) {unknown} that do not exist in this scene; "
+                    "use a name from the catalog's collision_targets"
+                )
         return tuple(
             self._resolve_check(recipe, context, check, valid_names)
             for check in recipe.checks
@@ -1009,7 +1350,7 @@ class StudyEvaluationBackend:
             context, check, template_check
         )
         object_states, allowed, payload_name, contact_name = self._resolve_payload(
-            check, template_check, template_step, world_start
+            check, template_check, template_step, world_start, context.steps
         )
         pose_check = LinearPoseCheck(
             name=check.check_id,
@@ -1039,6 +1380,9 @@ class StudyEvaluationBackend:
             world_end=world_end,
             excluded_applied=applied,
             missing_excluded=missing,
+            suppressed_snapshot_objects=tuple(
+                phase_step.suppress_snapshot_objects
+            ),
         )
 
     def _resolve_poses(
@@ -1083,6 +1427,7 @@ class StudyEvaluationBackend:
         template_check: LinearPoseCheck | None,
         template_step: TaskStepSpec | None,
         world_start: np.ndarray,
+        steps: Sequence[TaskStepSpec] = (),
     ) -> tuple[
         tuple[ObjectState, ...], tuple[tuple[str, str], ...], str | None, str | None
     ]:
@@ -1095,13 +1440,7 @@ class StudyEvaluationBackend:
             contact_name = template_check.contact_object_name
         elif template_step is not None:
             source_states = template_step.object_states
-            seen: list[tuple[str, str]] = []
-            for nested in template_step.pose_checks:
-                for pair in nested.allowed_contacts:
-                    canonical = tuple(sorted(pair))
-                    if canonical not in seen:
-                        seen.append(canonical)
-            allowed = tuple(seen)
+            allowed, _ = inherited_payload_contacts(steps, source_states)
             attached = [
                 state.name
                 for state in source_states
@@ -1151,23 +1490,29 @@ class StudyEvaluationBackend:
             for check in step.pose_checks:
                 if check.criticality is Criticality.HARD:
                     generated_hard.append(f"{step.index}:{check.name}")
-        authored = {
-            f"{check.template.step_index}:{check.template.check_name}"
-            for check in recipe.enabled_checks
-            if check.template is not None and check.template.supplies_pose
+        # A generated HARD check only counts as covered when an enabled
+        # authored check still carries it AS HARD. Downgrading it to SOFT
+        # removes it from the feasibility decision just as deleting it does.
+        referenced: dict[str, StudyCheck] = {}
+        for check in recipe.enabled_checks:
+            if check.template is None or not check.template.supplies_pose:
+                continue
+            referenced.setdefault(
+                f"{check.template.step_index}:{check.template.check_name}", check
+            )
+        covered_hard = {
+            name for name, check in referenced.items() if check.criticality_is_hard
         }
-        unmodified = {
-            f"{check.template.step_index}:{check.template.check_name}"
-            for check in recipe.enabled_checks
-            if check.template is not None
-            and check.template.supplies_pose
-            and check.is_unmodified_template
-        }
-        omitted = [name for name in generated_hard if name not in authored]
+        downgraded = [
+            name
+            for name in generated_hard
+            if name in referenced and name not in covered_hard
+        ]
+        omitted = [name for name in generated_hard if name not in covered_hard]
         modified = [
             name
             for name in generated_hard
-            if name in authored and name not in unmodified
+            if name in covered_hard and not referenced[name].is_unmodified_template
         ]
         authored_only = [
             check.check_id
@@ -1181,6 +1526,7 @@ class StudyEvaluationBackend:
             "generated_hard_check_count": len(generated_hard),
             "generated_hard_checks": generated_hard,
             "omitted_generated_hard_checks": omitted,
+            "downgraded_generated_hard_checks": downgraded,
             "modified_generated_hard_checks": modified,
             "extra_authored_checks": authored_only,
             "covers_generated_hard_set": not omitted,
@@ -1228,9 +1574,16 @@ class StudyEvaluationBackend:
                 + ", ".join(missing)
             )
         omitted = list(coverage.get("omitted_generated_hard_checks") or ())
-        if omitted:
+        downgraded = list(coverage.get("downgraded_generated_hard_checks") or ())
+        enabled_only = [name for name in omitted if name not in downgraded]
+        if enabled_only:
             reasons.append(
-                f"{len(omitted)} generated HARD check(s) omitted from this study"
+                f"{len(enabled_only)} generated HARD check(s) omitted from this study"
+            )
+        if downgraded:
+            reasons.append(
+                f"{len(downgraded)} generated HARD check(s) downgraded to SOFT, "
+                "so they no longer gate the result"
             )
         modified = list(coverage.get("modified_generated_hard_checks") or ())
         if modified:
@@ -1342,6 +1695,22 @@ class StudyEvaluationBackend:
                     job.completed += 1
             coverage = self._coverage(recipe, context)
             diagnostic = self._diagnostic_report(recipe, queue, coverage)
+            if fingerprint_override:
+                diagnostic = {
+                    **diagnostic,
+                    "reasons": [
+                        *diagnostic["reasons"],
+                        "evaluated with a scene/model fingerprint mismatch override",
+                    ],
+                }
+            if not context.placement.valid:
+                diagnostic = {
+                    **diagnostic,
+                    "reasons": [
+                        *diagnostic["reasons"],
+                        "original installation check rejects this base placement",
+                    ],
+                }
             result_payload = _study_result_payload(
                 recipe=recipe,
                 context=context,
@@ -1378,6 +1747,7 @@ class StudyEvaluationBackend:
         options: EvaluationOptions,
         settings: "ScoutSettings",
         fingerprint_override: bool,
+        base_context: WorkflowContext,
     ) -> None:
         started = self.clock()
         rows: list[dict[str, object]] = []
@@ -1395,7 +1765,11 @@ class StudyEvaluationBackend:
                     job.current_label = label
                 rows.append(
                     self._scout_candidate(
-                        recipe, base, options, job.cancel_event
+                        recipe,
+                        base,
+                        options,
+                        job.cancel_event,
+                        fingerprint_override,
                     )
                 )
                 with self._jobs_lock:
@@ -1404,23 +1778,41 @@ class StudyEvaluationBackend:
             feasible.sort(
                 key=lambda row: -float(row["worst_normalized_min_singular_value"])
             )
+            # A candidate whose collision contract or check set was weakened,
+            # or that was computed under a fingerprint override, cannot share
+            # a ranking with a candidate evaluated under the full contract.
+            strict = [row for row in feasible if not row["diagnostic"]]
+            diagnostic_rows = [row for row in feasible if row["diagnostic"]]
             with self._jobs_lock:
                 job.result = {
                     "schema_version": STUDY_API_VERSION,
                     "kind": "scout",
                     "recipe_hash": recipe.recipe_hash,
                     "recipe_id": recipe.recipe_id,
+                    "effective": self._effective_payload(recipe, base_context),
                     "settings": settings.payload(),
                     "candidates": rows,
-                    "ranking": feasible,
+                    "ranking_strict": strict,
+                    "ranking_diagnostic": diagnostic_rows,
+                    # Retained for compatibility with the first schema: it is
+                    # the strict ranking only, never the weakened rows.
+                    "ranking": strict,
                     "cancelled": cancelled,
                     "complete": not cancelled,
                     "fingerprint_override": fingerprint_override,
                     "elapsed_seconds": max(0.0, self.clock() - started),
                     "metric": "worst sampled normalized minimum singular value",
+                    "gates": [
+                        "original installation check (validate_base_placement)",
+                        "every enabled HARD check succeeded",
+                        "no collision-contract weakening and no omitted "
+                        "generated HARD check for a strict ranking position",
+                    ],
                     "interpretation": (
                         "study comparison of enabled HARD checks only; this is "
-                        "not a cell layout optimization result"
+                        "not a cell layout optimization result and does not "
+                        "cover SR cutting, the skipped pouring step, transfer "
+                        "paths, every SKU/corner, or dynamics"
                     ),
                 }
                 job.state = "cancelled" if cancelled else "completed"
@@ -1442,7 +1834,17 @@ class StudyEvaluationBackend:
         base: BasePose,
         options: EvaluationOptions,
         cancel_event: threading.Event,
+        fingerprint_override: bool = False,
     ) -> dict[str, object]:
+        """Evaluate one UR20 base candidate behind the original gates.
+
+        The installation check runs first and from scene geometry alone, so a
+        collision scenario that excludes targets cannot promote an
+        uninstallable base.  ``ik_not_found`` leaves the candidate UNKNOWN
+        rather than infeasible, and any weakening marks the row diagnostic so
+        it can never enter the strict ranking.
+        """
+
         row: dict[str, object] = {
             "ur_base": {
                 "x_m": base.x_m,
@@ -1454,28 +1856,58 @@ class StudyEvaluationBackend:
             "evaluated_checks": 0,
             "hard_check_count": 0,
             "failed_check": None,
+            "unresolved_checks": [],
             "worst_normalized_min_singular_value": 0.0,
+            "metric_available": False,
+            "diagnostic": True,
+            "diagnostic_reasons": [],
+            "installation": None,
+            "sr_workspace": None,
             "message": "",
         }
         try:
-            # Regenerating the workflow runs Pinocchio forward kinematics, so
-            # it belongs inside the shared compute lock just like the checks.
-            with self.compute_lock:
-                context = self._workflow_context(
-                    recipe.parameters or None, ur_base=base
-                )
-                resolved = [
-                    item
-                    for item in self._resolve_checks(recipe, context)
-                    if item.recipe_check.enabled
-                    and item.recipe_check.criticality_is_hard
-                ]
+            context = self._workflow_context(
+                recipe.parameters,
+                approach_distance_m=recipe.approach_distance_m,
+                ur_base=base,
+            )
+            resolved_all = self._resolve_checks(recipe, context)
+            coverage = self._coverage(recipe, context)
+            diagnostic = self._diagnostic_report(recipe, resolved_all, coverage)
+            resolved = [
+                item
+                for item in resolved_all
+                if item.recipe_check.enabled
+                and item.recipe_check.criticality_is_hard
+            ]
         except (RecipeError, ValueError, KeyError, RuntimeError) as exc:
             row["status"] = "rejected"
             row["message"] = str(exc)
             return row
+
+        reasons = list(diagnostic["reasons"])
+        if fingerprint_override:
+            reasons.append("scene/model fingerprint mismatch override")
+        row["diagnostic_reasons"] = reasons
+        row["diagnostic"] = bool(reasons)
+        row["installation"] = context.installation_payload()
+        row["sr_workspace"] = context.sr_workspace_payload()
         row["hard_check_count"] = len(resolved)
+
+        if not context.placement.valid:
+            # The original installation gate, applied before any IK cost.
+            row["status"] = "installation_invalid"
+            row["message"] = "; ".join(
+                issue.message for issue in context.placement.issues
+            )
+            return row
+        if not resolved:
+            row["status"] = "rejected"
+            row["message"] = "no enabled HARD check resolved for this candidate"
+            return row
+
         worst = math.inf
+        unresolved: list[dict[str, str]] = []
         previous_arm: np.ndarray | None = None
         nominal = tuple(float(value) for value in self.spec.robots["ur20"].nominal_q)
         for item in resolved:
@@ -1504,16 +1936,26 @@ class StudyEvaluationBackend:
             if last_arm is not None:
                 previous_arm = last_arm
             row["evaluated_checks"] = int(row["evaluated_checks"]) + 1
-            if result.status != "success":
+            outcome = check_outcome(result.status)
+            if outcome == "collision":
                 row["status"] = "infeasible"
                 row["failed_check"] = {
                     "check_id": item.recipe_check.check_id,
                     "status": result.status,
+                    "outcome": outcome,
                 }
                 # A partially evaluated candidate must never contribute a
                 # metric-based ranking position.
                 row["worst_normalized_min_singular_value"] = 0.0
                 return row
+            if outcome == "unresolved":
+                unresolved.append(
+                    {
+                        "check_id": item.recipe_check.check_id,
+                        "status": result.status,
+                    }
+                )
+                continue
             if item.recipe_check.include_in_metric_summary:
                 for sample in result.samples:
                     if sample.manipulability is None:
@@ -1524,9 +1966,14 @@ class StudyEvaluationBackend:
                             sample.manipulability.normalized_min_singular_value
                         ),
                     )
-        if not resolved:
-            row["status"] = "rejected"
-            row["message"] = "no enabled HARD check resolved for this candidate"
+        if unresolved:
+            row["status"] = "unknown"
+            row["unresolved_checks"] = unresolved
+            row["message"] = (
+                f"{len(unresolved)} HARD check(s) exhausted the deterministic "
+                "IK search; this is not a proof that no solution exists"
+            )
+            row["worst_normalized_min_singular_value"] = 0.0
             return row
         row["status"] = "feasible"
         row["worst_normalized_min_singular_value"] = (
@@ -1590,6 +2037,73 @@ def _apply_scenario(
         floor_z_m=phase.floor_z_m if scenario.include_floor else None,
     )
     return updated, applied, missing
+
+
+def inherited_payload_contacts(
+    steps: Sequence[TaskStepSpec],
+    object_states: Sequence[ObjectState],
+) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...]]:
+    """Return intended contacts for a payload-only template, with provenance.
+
+    A step such as 6 carries object state but no generated pose check, so its
+    own pose checks contribute nothing.  The states it carries are the very
+    same immutable ``ObjectState`` instances an earlier step's pose check
+    produced, so the intended contacts are recovered by matching the
+    *attached* instance by identity.  Both halves of that rule matter.
+    Identity excludes a check that merely moves a same-named carton in another
+    phase, and restricting the match to the carried payload excludes a check
+    that only shares a static bystander object.  Either leak would import a
+    support exemption from an unrelated phase and could mask a real collision.
+
+    The grasp contact between the suction pad and each attached object is
+    added explicitly rather than left to the collision adapter's default
+    exemption, so the resolved check reports the same pairs a generated check
+    would.
+
+    Without this a pouring-study pose would collision-check its own carried
+    carton against its support, and the only way to run it would be to switch
+    the payload off.
+    """
+
+    attached = tuple(
+        state.name
+        for state in object_states
+        if state.attached_to_tcp or state.follows_tcp
+    )
+    if not attached:
+        return (), ()
+    identities = {
+        id(state)
+        for state in object_states
+        if state.attached_to_tcp or state.follows_tcp
+    }
+    contacts: list[tuple[str, str]] = []
+    provenance: list[str] = []
+    for name in attached:
+        pair = tuple(sorted(("suction_pad", name)))
+        if pair not in contacts:
+            contacts.append(pair)
+    if contacts:
+        provenance.append("suction_pad grasp contact for " + ", ".join(attached))
+    for step in steps:
+        for check in step.pose_checks:
+            if not any(
+                id(state) in identities
+                for state in check.object_states
+                if state.attached_to_tcp or state.follows_tcp
+            ):
+                continue
+            added = False
+            for raw in check.allowed_contacts:
+                pair = tuple(sorted(raw))
+                if pair not in contacts:
+                    contacts.append(pair)
+                    added = True
+            if added:
+                provenance.append(
+                    f"step {step.index} check {check.name} (same carried payload)"
+                )
+    return tuple(contacts), tuple(provenance)
 
 
 def _free_space_step(snapshot: SceneSnapshot) -> TaskStepSpec:
@@ -1750,6 +2264,7 @@ def _check_result_payload(
         "criticality": item.recipe_check.criticality,
         "scenario_id": item.scenario.scenario_id,
         "status": result.status,
+        "outcome": check_outcome(result.status),
         "success": bool(result.success),
         "failed_sample_index": result.failed_sample_index,
         "collision_pair_count": int(collision_pair_count),
@@ -1826,44 +2341,90 @@ def _study_result_payload(
         name for name in soft_ids if name in by_id and not by_id[name]["success"]
     ]
 
+    hard_collisions = [
+        name
+        for name in evaluated_hard
+        if by_id[name]["outcome"] == "collision"
+    ]
+    hard_unresolved = [
+        name
+        for name in evaluated_hard
+        if by_id[name]["outcome"] == "unresolved"
+    ]
     weakened = bool(diagnostic.get("weakened_collision_contract"))
+    installation_valid = bool(context.placement.valid)
     if not hard_ids:
         status = "no_hard_checks"
         certification = "none"
-        headline = (
-            "No enabled HARD check. An empty HARD set is never a success."
-        )
-    elif unevaluated_hard or cancelled:
-        status = "unknown"
-        certification = "none"
-        headline = (
-            "Incomplete: "
-            f"{len(unevaluated_hard)} enabled HARD check(s) were not calculated"
-            + (" (run cancelled)" if cancelled else "")
-            + ". An uncalculated check is not a success."
-        )
-    elif hard_failures:
+        headline = "No enabled HARD check. An empty HARD set is never a success."
+    elif hard_collisions:
         status = "study_infeasible"
         certification = "none"
         headline = (
-            f"{len(hard_failures)} of {len(evaluated_hard)} HARD check(s) failed."
+            f"{len(hard_collisions)} of {len(evaluated_hard)} HARD check(s) hit "
+            "an actual collision at an attempted pose or segment."
+            + (
+                f" A further {len(hard_unresolved)} remained unresolved."
+                if hard_unresolved
+                else ""
+            )
+            # A collision witness settles the result, but a partial run must
+            # still say how much of the study it never looked at.
+            + (
+                f" {len(unevaluated_hard)} further HARD check(s) were not "
+                "calculated, so this is a partial study."
+                if unevaluated_hard
+                else ""
+            )
+            + (" The run was cancelled." if cancelled else "")
         )
-    elif weakened or coverage.get("omitted_generated_hard_checks"):
+    elif unevaluated_hard or cancelled or hard_unresolved:
+        status = "unknown"
+        certification = "none"
+        parts = []
+        if unevaluated_hard:
+            parts.append(
+                f"{len(unevaluated_hard)} enabled HARD check(s) were not calculated"
+            )
+        if hard_unresolved:
+            parts.append(
+                f"{len(hard_unresolved)} HARD check(s) exhausted the deterministic "
+                "IK search without a solution (ik_not_found)"
+            )
+        if cancelled:
+            parts.append("the run was cancelled")
+        headline = (
+            "UNKNOWN: "
+            + "; ".join(parts)
+            + ". An uncalculated or unresolved check is neither a success nor "
+            "a proof that no solution exists."
+        )
+    elif not installation_valid:
+        status = "installation_invalid"
+        certification = "none"
+        headline = (
+            "Every evaluated HARD check passed, but the original installation "
+            f"check rejects this base placement ({len(context.placement.issues)} "
+            "issue(s)). A collision scenario cannot waive the installation "
+            "gate, so this is not a usable layout."
+        )
+    elif weakened or coverage.get("omitted_generated_hard_checks") or fingerprint_override:
         status = "study_feasible_diagnostic"
         certification = "study_feasible_diagnostic"
         headline = (
-            "All evaluated HARD checks passed, but the collision contract or "
-            "the check set was weakened. This is a diagnostic result, not a "
-            "feasibility claim."
+            "All evaluated HARD checks passed, but the collision contract, the "
+            "check set or the scene identity was weakened. This is a diagnostic "
+            "result, not a feasibility claim."
         )
     else:
         status = "study_feasible"
         certification = "study_feasible"
         headline = (
             "All enabled HARD checks passed with the default collision "
-            "contract. study_feasible only: it does not cover the skipped "
-            "pouring step, transfer paths between checks, every SKU/corner, "
-            "or mass/suction/dynamics."
+            "contract, and the installation check accepts this placement. "
+            "study_feasible only: it does not cover the skipped pouring step, "
+            "transfer paths between checks, every SKU/corner, SR cutting, or "
+            "mass/suction/dynamics."
         )
     return {
         "schema_version": STUDY_API_VERSION,
@@ -1871,6 +2432,12 @@ def _study_result_payload(
         "recipe_hash": recipe.recipe_hash,
         "recipe_id": recipe.recipe_id,
         "parameters": _parameter_payload(context.key),
+        "effective": {
+            "parameters": _parameter_payload(context.key),
+            "approach_distance_m": context.approach_distance_m,
+            "profile": recipe.profile,
+            "source": "recipe (parameters and approach_distance_m are hashed)",
+        },
         "profile": recipe.profile,
         "profile_settings": {
             "cartesian_translation_step_m": options.cartesian_translation_step_m,
@@ -1884,6 +2451,8 @@ def _study_result_payload(
         "status": status,
         "certification": certification,
         "headline": headline,
+        "installation": context.installation_payload(),
+        "sr_workspace": context.sr_workspace_payload(),
         "cancelled": bool(cancelled),
         "complete": not cancelled and not unevaluated_hard,
         "fingerprint_override": bool(fingerprint_override),
@@ -1894,6 +2463,8 @@ def _study_result_payload(
         "hard_check_ids": hard_ids,
         "unevaluated_hard_check_ids": unevaluated_hard,
         "failed_hard_check_ids": hard_failures,
+        "collision_hard_check_ids": hard_collisions,
+        "unresolved_hard_check_ids": hard_unresolved,
         "failed_soft_check_ids": soft_failures,
         "coverage": dict(coverage),
         "diagnostic": dict(diagnostic),
@@ -1909,6 +2480,11 @@ def _resolved_check_payload(item: ResolvedCheck) -> dict[str, object]:
         "criticality": item.recipe_check.criticality,
         "scenario_id": item.scenario.scenario_id,
         "pose_mode": item.recipe_check.pose_mode,
+        "template": (
+            None
+            if item.recipe_check.template is None
+            else item.recipe_check.template.token
+        ),
         "offset_frame": item.recipe_check.offset_frame,
         "reference_frame": item.recipe_check.reference_frame,
         "world_start": _pose_to_6d(item.world_start).payload(),
@@ -2135,6 +2711,99 @@ def _parameter_payload(key: CaseKey) -> dict[str, object]:
     }
 
 
+def _case_parameter_schema(spec: SceneSpec, key: CaseKey) -> dict[str, object]:
+    """Describe the editable effective case for the browser's Case panel.
+
+    Bounds come from the same scene configuration the live UI uses, so the
+    study panel cannot offer a case the evaluator would reject.
+    """
+
+    region = spec.installation_region
+    tote_low, tote_high = tote_long_axis_offset_range_m(spec)
+    max_base_z = max(1.5, key.ur_base.z_m + 0.5, key.sr_base.z_m + 0.5)
+    workspace = spec.robots["sr12ia"].workspace
+    if workspace is None:
+        raise RecipeError("SR-12iA workspace specification is missing")
+
+    def number(
+        label: str,
+        unit: str,
+        minimum: float,
+        maximum: float,
+        step: float,
+        *,
+        nullable: bool = False,
+        scale: float = 1.0,
+    ) -> dict[str, object]:
+        return {
+            "kind": "number",
+            "label": label,
+            "unit": unit,
+            "min": minimum,
+            "max": maximum,
+            "step": step,
+            "nullable": nullable,
+            # ``ui_scale`` converts the stored metre value into the unit the
+            # panel displays, so the browser never guesses the conversion.
+            "ui_scale": scale,
+        }
+
+    def choice(label: str, options: list[dict[str, object]]) -> dict[str, object]:
+        return {"kind": "choice", "label": label, "options": options}
+
+    schema: dict[str, object] = {
+        "ur_x": number("UR20 X", "mm", region.raw_xy_min_m[0], region.raw_xy_max_m[0], 0.001, scale=1000.0),
+        "ur_y": number("UR20 Y", "mm", region.raw_xy_min_m[1], region.raw_xy_max_m[1], 0.001, scale=1000.0),
+        "ur_z": number("UR20 Z", "mm", 0.01, max_base_z, 0.001, scale=1000.0),
+        "ur_yaw": number("UR20 yaw", "deg", -180.0, 180.0, 0.5),
+        "sr_x": number("SR-12iA X", "mm", region.raw_xy_min_m[0], region.raw_xy_max_m[0], 0.001, scale=1000.0),
+        "sr_y": number("SR-12iA Y", "mm", region.raw_xy_min_m[1], region.raw_xy_max_m[1], 0.001, scale=1000.0),
+        "sr_z": number("SR-12iA Z", "mm", 0.01, max_base_z, 0.001, scale=1000.0),
+        "sr_yaw": number("SR-12iA yaw", "deg", -180.0, 180.0, 0.5),
+        "lift": number(
+            "Lift height",
+            "mm",
+            spec.pallet.lift_range_m[0],
+            spec.pallet.lift_range_m[1],
+            0.001,
+            scale=1000.0,
+        ),
+        "tote": number("Tote offset", "mm", tote_low, tote_high, 0.001, scale=1000.0),
+        "clearance": number(
+            "Clearance", "mm", 0.0, 0.20, 0.001, nullable=True, scale=1000.0
+        ),
+        "sku": choice(
+            "SKU",
+            [
+                {"value": sku, "label": f"{sku} · {item.label}"}
+                for sku, item in spec.box_skus.items()
+            ],
+        ),
+        "corner": choice(
+            "Pallet corner",
+            [{"value": value, "label": value} for value in CORNER_SIGNS],
+        ),
+        "mode": choice(
+            "Coordination",
+            [
+                {"value": mode.value, "label": mode.value}
+                for mode in (
+                    CoordinationMode.SEQUENTIAL,
+                    CoordinationMode.SIMULTANEOUS,
+                )
+            ],
+        ),
+        "stroke": choice(
+            "SR J3 stroke",
+            [
+                {"value": value, "label": f"{value * 1000.0:g} mm"}
+                for value in workspace.j3_stroke_options_m
+            ],
+        ),
+    }
+    return schema
+
+
 def _case_key_from_parameters(
     spec: SceneSpec, parameters: Mapping[str, object]
 ) -> CaseKey:
@@ -2225,6 +2894,24 @@ def _unique_identifier(candidate: str, used: set[str]) -> str:
         suffix += 1
     used.add(result)
     return result
+
+
+def _lock_is_reentrant(lock: object) -> bool:
+    """Whether the same thread can acquire ``lock`` twice without blocking."""
+
+    acquire = getattr(lock, "acquire", None)
+    release = getattr(lock, "release", None)
+    if not callable(acquire) or not callable(release):
+        return False
+    if not acquire(blocking=False):
+        return False
+    try:
+        if not acquire(blocking=False):
+            return False
+        release()
+        return True
+    finally:
+        release()
 
 
 def _required_mapping(value: object, name: str) -> Mapping[str, object]:

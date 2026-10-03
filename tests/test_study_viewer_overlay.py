@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
 from decanting_workspace.models import BoxPrimitive, MeshObstacle
 from decanting_workspace.viewer import CellViewer
+
+# MeshCat's create_camera sets /Cameras/default/rotated to a +pi/2 turn
+# about X, so a local camera offset (x, y, z) is World (x, -z, y).
+_ROTATED_X90 = np.array(
+    [
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0],
+        [0.0, 1.0, 0.0],
+    ]
+)
 
 
 class _RecordingNode:
@@ -14,6 +26,7 @@ class _RecordingNode:
         self.path = path
         self.objects: list[object] = []
         self.transforms: list[np.ndarray] = []
+        self.properties: list[tuple[str, object]] = []
         self.deleted = 0
 
     def delete(self) -> None:
@@ -24,6 +37,9 @@ class _RecordingNode:
 
     def set_transform(self, matrix) -> None:
         self.transforms.append(np.asarray(matrix).copy())
+
+    def set_property(self, name, value) -> None:
+        self.properties.append((name, value))
 
 
 class _RecordingViewer:
@@ -191,5 +207,127 @@ def test_study_overlays_never_touch_the_environment_or_playback_subtrees():
         [("c1", np.eye(4), 0x3478C5)], [("c1", (0, 0, 0), (0, 0, 1), 0x3478C5)]
     )
     viewer.render_study_target_highlight([_box()], [_mesh()])
+    viewer.render_study_payload(
+        [("box_a", (0.3, 0.2, 0.25), np.eye(4))], evaluated=False
+    )
     viewer.clear_study_overlays()
     assert all(path.startswith("decanting/study") for path in recorder.nodes)
+
+
+# ------------------------------------------- payload boxes and the camera
+
+
+def _payload(name: str = "box_a", z: float = 1.2):
+    transform = np.eye(4)
+    transform[2, 3] = z
+    return (name, (0.3, 0.2, 0.25), transform)
+
+
+def test_payload_boxes_are_drawn_under_the_study_root_by_provenance():
+    viewer, recorder = _viewer()
+    assert viewer.render_study_payload([_payload()], evaluated=False) == 1
+    schematic = "decanting/study/payload/schematic/box_a"
+    assert schematic in recorder.nodes
+    assert len(recorder.nodes[schematic].objects) == 1
+    assert recorder.nodes[schematic].transforms[0][2, 3] == pytest.approx(1.2)
+
+    assert viewer.render_study_payload([_payload()], evaluated=True) == 1
+    assert "decanting/study/payload/evaluated/box_a" in recorder.nodes
+
+
+def test_a_schematic_and_an_evaluated_payload_are_never_shown_together():
+    # A grey authored box next to a solved one would read as two results.
+    viewer, recorder = _viewer()
+    viewer.render_study_payload([_payload()], evaluated=False)
+    viewer.render_study_payload([_payload()], evaluated=True)
+    root = recorder.nodes["decanting/study/payload"]
+    # Each call deletes the whole payload root before drawing its own kind.
+    assert root.deleted == 2
+
+
+def test_an_empty_payload_clears_without_drawing():
+    viewer, recorder = _viewer()
+    assert viewer.render_study_payload((), evaluated=True) == 0
+    assert recorder.nodes["decanting/study/payload"].deleted == 1
+    assert not any(
+        node.objects
+        for path, node in recorder.nodes.items()
+        if path.startswith("decanting/study/payload/")
+    )
+
+
+def test_payload_boxes_reject_a_bad_transform_or_size():
+    viewer, _ = _viewer()
+    with pytest.raises(ValueError, match="finite 4 x 4"):
+        viewer.render_study_payload(
+            [("box_a", (0.3, 0.2, 0.25), np.eye(3))], evaluated=False
+        )
+    with pytest.raises(ValueError, match="finite 4 x 4"):
+        viewer.render_study_payload(
+            [("box_a", (0.3, 0.2, 0.25), np.full((4, 4), np.nan))],
+            evaluated=False,
+        )
+    with pytest.raises(ValueError, match="three positive sizes"):
+        viewer.render_study_payload(
+            [("box_a", (0.3, 0.0, 0.25), np.eye(4))], evaluated=False
+        )
+    with pytest.raises(ValueError, match="three positive sizes"):
+        viewer.render_study_payload(
+            [("box_a", (0.3, 0.2), np.eye(4))], evaluated=False
+        )
+
+
+def test_payload_names_cannot_create_extra_meshcat_nesting():
+    viewer, recorder = _viewer()
+    viewer.render_study_payload([_payload("../../escape")], evaluated=False)
+    assert all(
+        path.startswith("decanting/study/payload/schematic/")
+        and path.count("/") == 4
+        for path in recorder.nodes
+        if path.startswith("decanting/study/payload/schematic/")
+    )
+
+
+def test_focus_camera_looks_down_at_the_orbit_centre():
+    viewer, recorder = _viewer()
+    distance = 6.0
+    viewer.focus_camera((1.0, -7.0, 0.8), distance)
+    centre = recorder.nodes["/Cameras/default"]
+    assert centre.transforms[-1][:3, 3] == pytest.approx((1.0, -7.0, 0.8))
+    name, position = recorder.nodes[
+        "/Cameras/default/rotated/<object>"
+    ].properties[-1]
+    assert name == "position"
+    # The camera hangs under "/rotated", which MeshCat's create_camera turns
+    # by +pi/2 about X, so the recorded local offset has to be mapped into
+    # World before it says anything about where the viewer actually stands.
+    world = _ROTATED_X90 @ np.asarray(position, dtype=float)
+    # Above the cell, not under the floor: the screenshot regression this
+    # guards against had the camera below z = 0 looking up.
+    assert world[2] > 0.0
+    # Three quarter view: back off along -Y and +X so the front faces of the
+    # cell stay visible.
+    assert world[0] > 0.0
+    assert world[1] < 0.0
+    # Elevation stays a shallow look-down rather than a top view.
+    elevation_deg = math.degrees(
+        math.atan2(world[2], float(np.linalg.norm(world[:2])))
+    )
+    assert 15.0 < elevation_deg < 45.0
+    # The offset has to scale with the requested distance, or a large cell
+    # still opens inside its own geometry.
+    assert float(np.linalg.norm(world)) == pytest.approx(
+        distance * float(np.linalg.norm((0.72, 0.72, 0.52)))
+    )
+
+
+def test_focus_camera_rejects_a_bad_target_or_distance():
+    viewer, _ = _viewer()
+    with pytest.raises(ValueError, match="finite XYZ point"):
+        viewer.focus_camera((1.0, 2.0), 3.0)
+    with pytest.raises(ValueError, match="finite XYZ point"):
+        viewer.focus_camera((1.0, 2.0, float("nan")), 3.0)
+    with pytest.raises(ValueError, match="finite and positive"):
+        viewer.focus_camera((1.0, 2.0, 3.0), 0.0)
+    with pytest.raises(ValueError, match="finite and positive"):
+        viewer.focus_camera((1.0, 2.0, 3.0), float("inf"))

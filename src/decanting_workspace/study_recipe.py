@@ -40,6 +40,75 @@ _CRITICALITIES = ("hard", "soft")
 _TEMPLATE_KINDS = ("pose_check", "step_objects")
 WORLD_FRAME = "world"
 
+CASE_NUMERIC_PARAMETERS = (
+    "ur_x",
+    "ur_y",
+    "ur_z",
+    "ur_yaw",
+    "sr_x",
+    "sr_y",
+    "sr_z",
+    "sr_yaw",
+    "lift",
+    "tote",
+    "stroke",
+)
+CASE_NULLABLE_PARAMETERS = ("clearance",)
+CASE_TEXT_PARAMETERS = ("sku", "corner", "mode")
+CASE_PARAMETER_KEYS = frozenset(
+    (*CASE_NUMERIC_PARAMETERS, *CASE_NULLABLE_PARAMETERS, *CASE_TEXT_PARAMETERS)
+)
+"""The effective case the recipe is evaluated against.
+
+These are the same 15 keys the live ``/api/evaluate`` contract uses.  They
+live inside the recipe, so they are part of ``recipe_hash`` and therefore
+part of a run's identity: a result can never belong to a different case than
+the recipe it names.
+"""
+
+
+def validate_case_parameters(raw: Any, name: str = "parameters") -> dict[str, object]:
+    """Return the validated 15-key effective case of one recipe."""
+
+    if not isinstance(raw, Mapping):
+        raise RecipeError(f"{name} must be an object")
+    missing = sorted(CASE_PARAMETER_KEYS - set(raw))
+    unknown = sorted(set(raw) - CASE_PARAMETER_KEYS)
+    if missing:
+        raise RecipeError(
+            f"{name} is missing the effective case keys {missing}; a recipe "
+            "must name the case it was authored against"
+        )
+    if unknown:
+        raise RecipeError(f"{name} has unknown case keys: {unknown}")
+    result: dict[str, object] = {}
+    for key in CASE_NUMERIC_PARAMETERS:
+        result[key] = _number(raw[key], f"{name}.{key}")
+    for key in CASE_NULLABLE_PARAMETERS:
+        value = raw[key]
+        result[key] = None if value is None else _number(value, f"{name}.{key}")
+    for key in CASE_TEXT_PARAMETERS:
+        result[key] = _text(raw[key], f"{name}.{key}", 64)
+    return result
+
+
+def case_parameters_equal(first: Mapping[str, object], second: Mapping[str, object]) -> bool:
+    """Compare two effective cases exactly, including ``clearance=None``."""
+
+    if set(first) != set(second):
+        return False
+    for key, value in first.items():
+        other = second[key]
+        if value is None or other is None:
+            if value is not other:
+                return False
+        elif isinstance(value, str) or isinstance(other, str):
+            if value != other:
+                return False
+        elif float(value) != float(other):
+            return False
+    return True
+
 
 class RecipeError(ValueError):
     """Raised for any invalid recipe input; never escapes as a 500."""
@@ -531,6 +600,12 @@ class StudyRecipe:
     notes: str = ""
 
     def __post_init__(self) -> None:
+        # ``True == 1`` in Python, so a boolean must be refused explicitly
+        # rather than silently accepted as schema version 1.
+        if isinstance(self.schema_version, bool) or not isinstance(
+            self.schema_version, int
+        ):
+            raise RecipeError("schema_version must be an integer")
         if self.schema_version != STUDY_SCHEMA_VERSION:
             raise RecipeError(
                 f"unsupported study recipe schema: {self.schema_version!r}; "
@@ -554,9 +629,9 @@ class StudyRecipe:
         if not 0.0 < approach <= 2.0:
             raise RecipeError("approach_distance_m must be in (0, 2]")
         object.__setattr__(self, "approach_distance_m", approach)
-        if not isinstance(self.parameters, Mapping):
-            raise RecipeError("parameters must be an object")
-        object.__setattr__(self, "parameters", dict(self.parameters))
+        object.__setattr__(
+            self, "parameters", validate_case_parameters(self.parameters)
+        )
 
         if not self.scenarios:
             raise RecipeError("at least one collision scenario is required")

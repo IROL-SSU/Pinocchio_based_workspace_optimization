@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from decanting_workspace.study_recipe import (
+    CASE_PARAMETER_KEYS,
     MAX_RECIPE_BYTES,
     STUDY_SCHEMA_VERSION,
     CollisionScenario,
@@ -15,17 +16,40 @@ from decanting_workspace.study_recipe import (
     StudyCheck,
     StudyRecipe,
     TemplateRef,
+    case_parameters_equal,
     default_collision_scenario,
     recipe_file_name,
     rotation_matrix_zyx,
+    validate_case_parameters,
 )
+
+
+# A recipe now names its own effective case, so every fixture supplies the
+# full 15-key parameter set the evaluator actually consumes.
+CASE = {
+    "ur_x": -1.3,
+    "ur_y": -7.35,
+    "ur_z": 0.85,
+    "ur_yaw": 90.0,
+    "sr_x": -0.3,
+    "sr_y": -7.073643684,
+    "sr_z": 0.665,
+    "sr_yaw": -90.0,
+    "sku": "123591",
+    "lift": 0.2,
+    "tote": 0.7,
+    "stroke": 0.45,
+    "clearance": None,
+    "corner": "southwest",
+    "mode": "sequential",
+}
 
 
 def _recipe(**overrides) -> StudyRecipe:
     base = {
         "recipe_id": "r1",
         "label": "recipe one",
-        "parameters": {"ur_x": -1.3},
+        "parameters": dict(CASE),
         "checks": (
             StudyCheck(
                 check_id="c1",
@@ -346,12 +370,57 @@ def test_canonical_json_never_contains_nan_or_infinity():
 
 def test_from_json_rejects_nan_infinity_literals():
     for literal in ("NaN", "Infinity", "-Infinity"):
-        document = (
-            '{"recipe_id":"r","label":"r","parameters":{},'
-            f'"approach_distance_m":{literal}}}'
+        document = json.dumps(
+            {"recipe_id": "r", "label": "r", "parameters": CASE}
         )
+        document = document[:-1] + f',"approach_distance_m":{literal}}}'
         with pytest.raises(RecipeError, match="must not contain|must be finite"):
             StudyRecipe.from_json(document)
+
+
+def test_recipe_requires_the_full_effective_case():
+    with pytest.raises(RecipeError, match="missing the effective case keys"):
+        _recipe(parameters={"ur_x": -1.3}, checks=())
+    with pytest.raises(RecipeError, match="unknown case keys"):
+        _recipe(parameters={**CASE, "surprise": 1}, checks=())
+    with pytest.raises(RecipeError, match="must be finite"):
+        _recipe(parameters={**CASE, "ur_x": float("inf")}, checks=())
+    with pytest.raises(RecipeError, match="must be numeric"):
+        _recipe(parameters={**CASE, "lift": "0.2"}, checks=())
+    # A nullable clearance stays nullable, and nothing else may be null.
+    assert _recipe(parameters={**CASE, "clearance": None}, checks=()).parameters[
+        "clearance"
+    ] is None
+
+
+def test_the_effective_case_is_part_of_the_recipe_hash():
+    first = _recipe(parameters=dict(CASE), checks=())
+    moved = _recipe(parameters={**CASE, "ur_x": -1.0}, checks=())
+    assert first.recipe_hash != moved.recipe_hash
+    other_sku = _recipe(parameters={**CASE, "sku": "430060"}, checks=())
+    assert first.recipe_hash != other_sku.recipe_hash
+
+
+def test_approach_distance_is_part_of_the_recipe_hash():
+    first = _recipe(checks=())
+    further = _recipe(approach_distance_m=0.8, checks=())
+    assert first.recipe_hash != further.recipe_hash
+
+
+def test_case_parameters_equal_treats_none_and_numbers_exactly():
+    assert case_parameters_equal(dict(CASE), dict(CASE))
+    assert case_parameters_equal({**CASE}, {**CASE, "ur_x": -1.3})
+    assert not case_parameters_equal({**CASE}, {**CASE, "ur_x": -1.30001})
+    assert not case_parameters_equal({**CASE}, {**CASE, "clearance": 0.0})
+    assert not case_parameters_equal({**CASE}, {**CASE, "sku": "430060"})
+    assert not case_parameters_equal({"ur_x": 1.0}, dict(CASE))
+
+
+@pytest.mark.parametrize("value", [True, False, 1.5, "1", None])
+def test_schema_version_rejects_booleans_and_non_integers(value):
+    # ``True == 1`` in Python, so a boolean must not pass as version 1.
+    with pytest.raises(RecipeError, match="schema_version|unsupported"):
+        _recipe(schema_version=value, checks=())
 
 
 def test_from_json_rejects_oversized_documents():

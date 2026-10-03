@@ -56,6 +56,9 @@ class _StudyStub:
     def clear_preview(self, request):
         return self._record("clear_preview", request)
 
+    def frame_cell(self, request):
+        return self._record("frame_cell", request)
+
     def save_recipe(self, request):
         return self._record("save_recipe", request)
 
@@ -218,6 +221,7 @@ def test_study_page_is_served_at_its_own_path(served):
         ("/api/study/validate", "validate"),
         ("/api/study/preview", "preview"),
         ("/api/study/preview/clear", "clear_preview"),
+        ("/api/study/frame", "frame_cell"),
         ("/api/study/recipe/save", "save_recipe"),
         ("/api/study/recipe/load", "load_recipe"),
         ("/api/study/recipe/import", "import_recipe"),
@@ -248,6 +252,7 @@ def test_job_control_routes_are_not_serialized(served):
         "/api/study/catalog",
         "/api/study/validate",
         "/api/study/preview",
+        "/api/study/frame",
         "/api/study/evaluate",
         "/api/study/scout",
         "/api/study/show",

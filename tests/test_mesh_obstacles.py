@@ -425,3 +425,44 @@ def test_viewer_displays_triangles_and_keeps_alternative_samples():
     floor = recorder.nodes["decanting/environment/floor"]
     floor_right = floor.transforms[0][0, 3] + floor.objects[0].lengths[0] / 2.0
     assert floor_right > 20.0
+
+
+def test_update_scene_hides_exactly_the_named_snapshot_objects():
+    # A caller that redraws one phase's moving objects itself has to be able
+    # to remove the nominal copy, or the same carton is shown twice.
+    spec = load_scene_spec()
+    snapshot = materialize_scene(spec)
+    movable = [
+        box
+        for box in snapshot.boxes
+        if box.role in {"box", "box_sample_alternative", "tote"}
+    ]
+    assert len(movable) >= 2
+    carried, other = movable[0], movable[1]
+    recorder = _RecordingViewer()
+    viewer = object.__new__(CellViewer)
+    viewer.viewer = recorder
+
+    viewer.update_scene(
+        spec,
+        snapshot,
+        show_frames=False,
+        show_sr_cutting_workspace=False,
+        hide_object_names=(carried.name,),
+    )
+    assert (
+        f"decanting/environment/{carried.role}/{carried.name}"
+        not in recorder.nodes
+    )
+    assert f"decanting/environment/{other.role}/{other.name}" in recorder.nodes
+    # A name that is not in the scene must simply hide nothing.
+    plain = _RecordingViewer()
+    viewer.viewer = plain
+    viewer.update_scene(
+        spec,
+        snapshot,
+        show_frames=False,
+        show_sr_cutting_workspace=False,
+        hide_object_names=("no_such_object",),
+    )
+    assert f"decanting/environment/{carried.role}/{carried.name}" in plain.nodes

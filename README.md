@@ -46,6 +46,19 @@ Implemented in this stage:
   local Python process and immediately presents its in-memory result in
   Meshcat.
 
+## UR20 check study
+
+`decanting-live`를 실행한 뒤 `http://127.0.0.1:8766/study`를 열면 check pose와 collision scenario를 직접 편집할 수 있다. 기존 live 화면의 **UR20 check study** 링크로도 들어갈 수 있다. `--port`를 지정했다면 같은 port의 `/study`를 사용한다.
+
+1. `Case parameters`에서 base·SKU·corner 등의 값을 정하고 **Apply case & refresh catalog**로 적용한다.
+2. 기존 check를 복제하고 TCP pose, payload template, collision scenario를 편집한다. 화면 길이는 mm, 저장 길이는 m다.
+3. **Preview in 3D**로 marker를 확인하고 **Evaluate selected check** 또는 **Evaluate all enabled**로 계산한다. **Frame cell**은 camera를 cell에 맞춘다.
+4. **Save to server**로 `outputs/study_recipes/`에 recipe를 저장한다. JSON download/upload와 저장본 재로딩도 지원한다.
+
+Collision target checkbox는 **켜면 제외**이며 제외·추가 contact 허용은 diagnostic 결과로 구분한다. 설치 조건은 별도로 유지한다. Bounded scout는 설치 조건과 활성 HARD check를 통과한 후보를 비교하되 strict·diagnostic 순위를 분리한다. IK 탐색에서 해를 못 찾은 상태는 `UNKNOWN`이며, 전체 cycle 불가능의 증명이 아니다.
+
+이 화면은 사용자 check의 기구학·충돌 study다. 전체 공정 간 transfer planning, pouring 자동 생성, 모든 SKU·오차를 포함한 production optimizer는 후속 범위다. [Proposal·GUI 사용법](https://github.com/dhlee04/research-wiki/blob/master/docs/%5BCodex%5D%20UR20_Study_GUI_%EC%82%AC%EC%9A%A9%EB%B2%95_2026-10-03.md)은 연구 문서 저장소 접근 권한이 필요하다.
+
 ## Fresh-machine setup
 
 Pixi is not used. Clone the repository at any filesystem location. BGF is
